@@ -105,6 +105,7 @@ the vendor driver for daily use.
 
 The current source tree is the v10diag diagnostic build.  Release assets
 are marked **pre-release**:
+[`v10diag-termux-testing`](https://github.com/soulexit/panvk-kirin990-termux/releases/tag/v10diag-termux-testing).
 
 - **Termux native**: `libvulkan_panfrost-termux-v10diag.so`, SHA-256
   `2ab681d0054b8655b5921dfd20aeda9ea85ec1afc373c5365a22c6b5c6a6dfc9`.
