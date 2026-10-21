@@ -158,6 +158,10 @@ The detailed v5–v10diag history, atom counts, and feature flags are in
   must be the same (not 4×) for comparisons.
 - This repository does not claim stable FPS improvements yet.
 
+## Development assistance
+
+Made with help from **DeepSeek** and **OpenCode**.
+
 ## License
 
 The Mesa-derived patches and code are under the Mesa MIT license.  The
