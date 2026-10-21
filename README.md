@@ -101,6 +101,22 @@ vulkaninfo --summary
 The driver is still an experimental PanVK build.  It does not replace
 the vendor driver for daily use.
 
+## Testing releases
+
+The current source tree is the v10diag diagnostic build.  Release assets
+are marked **pre-release**:
+
+- **Termux native**: `libvulkan_panfrost-termux-v10diag.so`, SHA-256
+  `2ab681d0054b8655b5921dfd20aeda9ea85ec1afc373c5365a22c6b5c6a6dfc9`.
+  Built at `10cbdd39403`; smoke-tested with the exact 4×4 draw.
+- **Winlator/Ludashi**: `panvk-g76-winlator.zip`, SHA-256
+  `43bbe241be0f650b5159b67fdd56d57683eada55504ec5f9a0bc0f5887bc0502`.
+  This is the older Winlator pack, not an ARMSX2 pack.
+
+The Termux-native build enables X11 WSI and requires the Termux packages
+listed above.  It has **not** been performance-validated in a game.  See
+[docs/RELEASE_NOTES_termux_v10diag.md](docs/RELEASE_NOTES_termux_v10diag.md).
+
 ## Winlator / Ludashi (adrenotools)
 
 The flat package in `releases/panvk-g76-winlator.zip` can be imported by

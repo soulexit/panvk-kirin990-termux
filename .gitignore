@@ -6,4 +6,3 @@ logs-*
 /build-*/
 /mesa/
 *.so
-!releases/*.so
