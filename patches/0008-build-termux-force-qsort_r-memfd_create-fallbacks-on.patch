@@ -1,0 +1,63 @@
+From bf3fc7330c2d1b0504ea8ad3949edf5cc49be6d5 Mon Sep 17 00:00:00 2001
+From: OpenCode Build <build@localhost>
+Date: Mon, 19 Oct 2026 20:31:43 +0300
+Subject: [PATCH panvk-kirin990 08/23] build(termux): force
+ qsort_r/memfd_create fallbacks on Android (device lacks API30+/API36+ libc
+ symbols)
+
+---
+ meson.build | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 028610f29f8..ba94baaf2de 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1643,12 +1643,25 @@ functions_to_detect = {
+ }
+ 
+ foreach f, prefix: functions_to_detect
++  # Termux/Android portability fix: memfd_create(2) is only exported by Bionic
++  # from API 30 onwards.  When the build targets an older API (or uses weak
++  # unavailable-symbol references, as the Termux build does), the feature test
++  # still succeeds against the weak declaration, but the symbol resolves to NULL
++  # at runtime on older devices.  Force Mesa's own fallback path instead.
++  if f == 'memfd_create' and with_platform_android and get_option('platform-sdk-version') < 30
++    continue
++  endif
+   if cc.has_function(f, args: pre_args, prefix: prefix)
+     pre_args += '-DHAVE_@0@'.format(f.to_upper())
+   endif
+ endforeach
+ 
+-if cpp.links('''
++# Termux/Android portability fix: Bionic only exports qsort_r() from API 36
++# onwards.  With weak unavailable-symbol references the feature tests below
++# succeed even though the symbol is absent on the running device, so skip them
++# and let util_qsort_r() use its thread-local-storage fallback.
++if not (with_platform_android and get_option('platform-sdk-version') < 36)
++  if cpp.links('''
+     #define _GNU_SOURCE
+     #include <stdlib.h>
+ 
+@@ -1662,8 +1675,8 @@ if cpp.links('''
+     }''',
+     args : pre_args,
+     name : 'GNU qsort_r')
+-  pre_args += '-DHAVE_GNU_QSORT_R'
+-elif cpp.links('''
++    pre_args += '-DHAVE_GNU_QSORT_R'
++  elif cpp.links('''
+     #include <stdlib.h>
+ 
+     static int dcomp(void *t, const void *l, const void *r) { return 0; }
+@@ -1676,7 +1689,8 @@ elif cpp.links('''
+     }''',
+     args : pre_args,
+     name : 'BSD qsort_r')
+-  pre_args += '-DHAVE_BSD_QSORT_R'
++    pre_args += '-DHAVE_BSD_QSORT_R'
++  endif
+ endif
+ 
+ if cc.has_header_symbol('time.h', 'struct timespec')

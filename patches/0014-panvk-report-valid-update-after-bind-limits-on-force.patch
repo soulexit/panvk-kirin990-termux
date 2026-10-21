@@ -1,0 +1,100 @@
+From 4637c22f5d73144ff6c73d268ed8dcb258e52769 Mon Sep 17 00:00:00 2001
+From: OpenCode Build <build@localhost>
+Date: Tue, 20 Oct 2026 23:10:30 +0300
+Subject: [PATCH panvk-kirin990 14/23] panvk: report valid update-after-bind
+ limits on forced Bifrost profile
+
+The Winlator/DXVK bring-up forces descriptorIndexing and the
+update-after-bind features on, but all corresponding limits were still
+guarded by PAN_ARCH >= 9 and therefore reported as zero on G76.  That is
+spec-inconsistent and can make DXVK/VKD3D descriptor pool setup fail.
+
+Report the same per-stage, per-set and dynamic limits that the driver
+already reports for the non-update-after-bind path.  Also fix the
+maintenance7 aggregate limits.
+---
+ .../vulkan/panvk_vX_physical_device.c         | 40 +++++++++----------
+ 1 file changed, 20 insertions(+), 20 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index cce0f9c3bee..f955728d44f 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -1088,9 +1088,9 @@ panvk_per_arch(get_physical_device_properties)(
+       .shaderRoundingModeRTZFloat32 = true,
+       .shaderRoundingModeRTZFloat64 = false,
+       .maxUpdateAfterBindDescriptorsInAllPools =
+-         PAN_ARCH >= 9 ? UINT32_MAX : 0,
++         UINT32_MAX,
+       /* VK_EXT_descriptor_indexing */
+-      .maxUpdateAfterBindDescriptorsInAllPools = PAN_ARCH >= 9 ? UINT32_MAX : 0,
++      .maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX,
+       .shaderUniformBufferArrayNonUniformIndexingNative = false,
+       .shaderSampledImageArrayNonUniformIndexingNative = false,
+       .shaderStorageBufferArrayNonUniformIndexingNative = false,
+@@ -1099,35 +1099,35 @@ panvk_per_arch(get_physical_device_properties)(
+       .robustBufferAccessUpdateAfterBind = PAN_ARCH >= 9,
+       .quadDivergentImplicitLod = false,
+       .maxPerStageDescriptorUpdateAfterBindSamplers =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_SAMPLERS : 0,
++         MAX_PER_STAGE_SAMPLERS,
+       .maxPerStageDescriptorUpdateAfterBindUniformBuffers =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_UNIFORM_BUFFERS : 0,
++         MAX_PER_STAGE_UNIFORM_BUFFERS,
+       .maxPerStageDescriptorUpdateAfterBindStorageBuffers =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_STORAGE_BUFFERS : 0,
++         MAX_PER_STAGE_STORAGE_BUFFERS,
+       .maxPerStageDescriptorUpdateAfterBindSampledImages =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_SAMPLED_IMAGES : 0,
++         MAX_PER_STAGE_SAMPLED_IMAGES,
+       .maxPerStageDescriptorUpdateAfterBindStorageImages =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_STORAGE_IMAGES : 0,
++         MAX_PER_STAGE_STORAGE_IMAGES,
+       .maxPerStageDescriptorUpdateAfterBindInputAttachments =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_INPUT_ATTACHMENTS : 0,
++         MAX_PER_STAGE_INPUT_ATTACHMENTS,
+       .maxPerStageUpdateAfterBindResources =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_RESOURCES : 0,
++         MAX_PER_STAGE_RESOURCES,
+       .maxDescriptorSetUpdateAfterBindSamplers =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_SAMPLERS : 0,
++         MAX_PER_SET_SAMPLERS,
+       .maxDescriptorSetUpdateAfterBindUniformBuffers =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_UNIFORM_BUFFERS : 0,
++         MAX_PER_SET_UNIFORM_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindUniformBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_UNIFORM_BUFFERS : 0,
++         MAX_DYNAMIC_UNIFORM_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindStorageBuffers =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_STORAGE_BUFFERS : 0,
++         MAX_PER_SET_STORAGE_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindStorageBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_STORAGE_BUFFERS : 0,
++         MAX_DYNAMIC_STORAGE_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindSampledImages =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_SAMPLED_IMAGES : 0,
++         MAX_PER_SET_SAMPLED_IMAGES,
+       .maxDescriptorSetUpdateAfterBindStorageImages =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_STORAGE_IMAGES : 0,
++         MAX_PER_SET_STORAGE_IMAGES,
+       .maxDescriptorSetUpdateAfterBindInputAttachments =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_INPUT_ATTACHMENTS : 0,
++         MAX_PER_SET_INPUT_ATTACHMENTS,
+       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT |
+                                     VK_RESOLVE_MODE_AVERAGE_BIT |
+                                     VK_RESOLVE_MODE_MIN_BIT |
+@@ -1251,11 +1251,11 @@ panvk_per_arch(get_physical_device_properties)(
+       .maxDescriptorSetTotalStorageBuffersDynamic = MAX_DYNAMIC_STORAGE_BUFFERS,
+       .maxDescriptorSetTotalBuffersDynamic = MAX_DYNAMIC_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_UNIFORM_BUFFERS : 0,
++         MAX_DYNAMIC_UNIFORM_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_STORAGE_BUFFERS : 0,
++         MAX_DYNAMIC_STORAGE_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindTotalBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_BUFFERS : 0,
++         MAX_DYNAMIC_BUFFERS,
+ 
+       /* VK_KHR_maintenance9 */
+       /* Sparse binding not supported yet. */

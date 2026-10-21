@@ -1,0 +1,78 @@
+From d600172b102a79404e4686e2483981e04e85eace Mon Sep 17 00:00:00 2001
+From: OpenCode Build <build@localhost>
+Date: Mon, 19 Oct 2026 20:46:33 +0300
+Subject: [PATCH panvk-kirin990 11/23] build(termux): compile panthor kmod
+ helpers for kbase-only panvk CSF references
+
+---
+ src/panfrost/lib/kmod/meson.build |  6 +++++-
+ src/panfrost/vulkan/meson.build   | 25 +++++--------------------
+ 2 files changed, 10 insertions(+), 21 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/meson.build b/src/panfrost/lib/kmod/meson.build
+index 97a7316bad9..771a6d89514 100644
+--- a/src/panfrost/lib/kmod/meson.build
++++ b/src/panfrost/lib/kmod/meson.build
+@@ -9,7 +9,11 @@ if panfrost_kmds.contains('panfrost')
+   libpankmod_lib_files += files('panfrost_kmod.c')
+ endif
+ 
+-if panfrost_kmds.contains('panthor')
++if panfrost_kmds.contains('panthor') or panfrost_kmds.contains('kbase')
++  # Termux/kbase portability fix: the panvk CSF (Valhall) sources call
++  # panthor_kmod_get_flush_id()/panthor_kmod_get_csif_props() unconditionally,
++  # so those helpers must be compiled in even for a kbase-only build (they are
++  # only reachable for JM/Bifrost hardware at runtime).
+   libpankmod_lib_files += files('panthor_kmod.c')
+ endif
+ 
+diff --git a/src/panfrost/vulkan/meson.build b/src/panfrost/vulkan/meson.build
+index e106bbc1e0f..36589235e6f 100644
+--- a/src/panfrost/vulkan/meson.build
++++ b/src/panfrost/vulkan/meson.build
+@@ -4,23 +4,6 @@
+ # Copyright © 2017 Intel Corporation
+ # SPDX-License-Identifier: MIT
+ 
+-# Termux/kbase portability fix: the kbase backend only implements the Job
+-# Manager (Bifrost/JM) path.  The CSF (Valhall) panvk sources reference
+-# panthor-only helpers (panthor_kmod_get_csif_props / panthor_kmod_get_flush_id)
+-# that are not compiled when the panthor kmd is not selected, so only build the
+-# JM architectures in that configuration.  v9 has no per-arch library either
+-# way and is referenced weakly.
+-if panfrost_kmds.contains('kbase') and not panfrost_kmds.contains('panthor')
+-  panvk_archs = [6, 7]
+-else
+-  panvk_archs = [6, 7, 10, 12, 13, 14]
+-endif
+-
+-panvk_device_prefix_args = []
+-foreach arch : panvk_archs
+-  panvk_device_prefix_args += ['--device-prefix', 'panvk_v@0@'.format(arch)]
+-endforeach
+-
+ panvk_entrypoints = custom_target(
+   'panvk_entrypoints.[ch]',
+   input : [vk_entrypoints_gen, vk_api_xml],
+@@ -28,7 +11,10 @@ panvk_entrypoints = custom_target(
+   command : [
+     prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
+     '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'panvk',
+-    panvk_device_prefix_args,
++    '--device-prefix', 'panvk_v6', '--device-prefix', 'panvk_v7',
++    '--device-prefix', 'panvk_v9', '--device-prefix', 'panvk_v10',
++    '--device-prefix', 'panvk_v12', '--device-prefix', 'panvk_v13',
++    '--device-prefix', 'panvk_v14',
+     '--beta', with_vulkan_beta.to_string()
+   ],
+   depend_files : vk_entrypoints_gen_depend_files,
+@@ -156,8 +142,7 @@ common_per_arch_files = [
+   sha1_h,
+ ]
+ 
+-# Build one panvk library per supported architecture (see panvk_archs above).
+-foreach arch : panvk_archs
++foreach arch : [6, 7, 10, 12, 13, 14]
+   per_arch_files = common_per_arch_files
+   inc_panvk_per_arch = []
+ 

@@ -1,0 +1,9 @@
+logs-*
+*.log
+!docs/*.log
+*.zip
+!releases/*.zip
+/build-*/
+/mesa/
+*.so
+!releases/*.so

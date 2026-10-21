@@ -1,0 +1,69 @@
+From 10cbdd39403c29d4d18dd2dafe83ff0e1fb19f8d Mon Sep 17 00:00:00 2001
+From: panvk <panvk@local>
+Date: Wed, 21 Oct 2026 21:33:57 +0300
+Subject: [PATCH panvk-kirin990 23/23] panvk/jm: report diagnostic window
+ totals
+
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 39 +++++++++++----------
+ 1 file changed, 20 insertions(+), 19 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 90aad17efe9..9a1813fb11b 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -453,7 +453,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+          &panvk_jm_diag.present_count, 0, memory_order_relaxed);
+       const unsigned gpu_khz = jm_read_gpu_khz();
+ 
+-      panvk_jm_log("cpu wall_ms=%" PRIu64 " interval_us=%" PRIu64
++      panvk_jm_log("cpu submits=%u wall_ms=%" PRIu64 " interval_us=%" PRIu64
+                    " draw_us=%" PRIu64 " draw_n=%" PRIu64
+                    " barrier_us=%" PRIu64 " barrier_n=%" PRIu64
+                    " render_us=%" PRIu64 " render_n=%" PRIu64
+@@ -464,26 +464,27 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+                    " push_us=%" PRIu64 " push_n=%" PRIu64
+                    " present_us=%" PRIu64 " present_n=%" PRIu64
+                    " gpu_khz=%u\n",
++                   jm_diag_submits,
+                    wall_ns / 1000000,
+                    wall_ns / 1000 / jm_diag_submits,
+-                   draw_ns / 1000 / jm_diag_submits,
+-                   draw_count / jm_diag_submits,
+-                   barrier_ns / 1000 / jm_diag_submits,
+-                   barrier_count / jm_diag_submits,
+-                   render_ns / 1000 / jm_diag_submits,
+-                   render_count / jm_diag_submits,
+-                   desc_ns / 1000 / jm_diag_submits,
+-                   desc_count / jm_diag_submits,
+-                   update_ns / 1000 / jm_diag_submits,
+-                   update_count / jm_diag_submits,
+-                   vbs_ns / 1000 / jm_diag_submits,
+-                   vbs_count / jm_diag_submits,
+-                   ib_ns / 1000 / jm_diag_submits,
+-                   ib_count / jm_diag_submits,
+-                   push_ns / 1000 / jm_diag_submits,
+-                   push_count / jm_diag_submits,
+-                   present_ns / 1000 / jm_diag_submits,
+-                   present_count / jm_diag_submits,
++                   draw_ns / 1000,
++                   draw_count,
++                   barrier_ns / 1000,
++                   barrier_count,
++                   render_ns / 1000,
++                   render_count,
++                   desc_ns / 1000,
++                   desc_count,
++                   update_ns / 1000,
++                   update_count,
++                   vbs_ns / 1000,
++                   vbs_count,
++                   ib_ns / 1000,
++                   ib_count,
++                   push_ns / 1000,
++                   push_count,
++                   present_ns / 1000,
++                   present_count,
+                    gpu_khz);
+       jm_diag_window_start_ns = now;
+ 

@@ -1,0 +1,380 @@
+From 0dc6991a5596bfa0aa54e8b6b620aa2a194f8510 Mon Sep 17 00:00:00 2001
+From: OpenCode Build <build@localhost>
+Date: Tue, 20 Oct 2026 02:18:24 +0300
+Subject: [PATCH panvk-kirin990 13/23] panvk: Android-only Winlator/DXVK
+ support for kbase 11.16 (G76)
+
+- Advertise VK_KHR_android_surface and include Android in PANVK_USE_WSI_PLATFORM so VK_KHR_surface/swapchain are exposed to the Android loader (the loader implements the ANB swapchain).
+- Allow arch 7 on the kbase/JM backend without PAN_I_WANT_A_BROKEN_VULKAN_DRIVER; Android launchers probe the ICD before a container environment exists.
+- Probe native_handle fds for the dma-buf instead of assuming data[0], matching Huawei gralloc.
+- Use the 32-byte kbase mem_import ABI on JM uAPI < 11.20. This kernel reports 11.16, so the modern 24-byte ioctl is rejected with ENOTTY and VK_ANDROID_native_buffer/AHB import fails.
+- Force the features and limits DXVK requires on Bifrost (geometry/tessellation flags, multi-viewport, clip/cull distance, descriptor indexing/update-after-bind, indirect draw limits). These are testing overrides; the Bifrost geometry/tessellation paths are not complete yet.
+
+Validated on Kirin 990 / Mali-G76 MC16, kernel 4.14.116, kbase 11.16:
+- Winlator/DXVK feature probe: PASS (0 missing).
+- AHB import + map: 256x256 RGBA8.
+- ANB swapchain-image import + GPU clear + CPU readback: all 4096 pixels.
+- compute (0x309) and draw (255,0,0,255) smoke tests pass.
+---
+ include/drm-uapi/mali_kbase_ioctl.h           | 22 ++++++
+ src/panfrost/lib/kmod/kbase_kmod.c            | 32 +++++++-
+ src/panfrost/vulkan/panvk_android.c           | 17 ++++-
+ src/panfrost/vulkan/panvk_instance.c          |  3 +
+ src/panfrost/vulkan/panvk_instance.h          |  3 +-
+ src/panfrost/vulkan/panvk_physical_device.c   |  7 +-
+ .../vulkan/panvk_vX_physical_device.c         | 75 +++++++++----------
+ src/vulkan/runtime/vk_android.c               | 16 +++-
+ 8 files changed, 131 insertions(+), 44 deletions(-)
+
+diff --git a/include/drm-uapi/mali_kbase_ioctl.h b/include/drm-uapi/mali_kbase_ioctl.h
+index c0b110a8241..d863189b322 100644
+--- a/include/drm-uapi/mali_kbase_ioctl.h
++++ b/include/drm-uapi/mali_kbase_ioctl.h
+@@ -344,6 +344,28 @@ union kbase_ioctl_mem_import {
+ #define KBASE_IOCTL_MEM_IMPORT \
+    _IOWR(KBASE_IOCTL_TYPE, 22, union kbase_ioctl_mem_import)
+ 
++/* Older JM kernels (uAPI < 11.20) use a 32-byte mem_import structure.  The
++ * field offsets are identical to the modern one; only the trailing padding
++ * differs, so the ioctl number (which encodes sizeof) changes.
++ */
++union kbase_ioctl_mem_import_11_16 {
++   struct {
++      __u64 flags;
++      __u64 phandle;
++      __u32 type;
++      __u32 padding;
++      __u64 padding2;
++   } in;
++   struct {
++      __u64 flags;
++      __u64 gpu_va;
++      __u64 va_pages;
++      __u64 padding;
++   } out;
++};
++#define KBASE_IOCTL_MEM_IMPORT_11_16 \
++   _IOWR(KBASE_IOCTL_TYPE, 22, union kbase_ioctl_mem_import_11_16)
++
+ /* base_mem_import_type */
+ #define BASE_MEM_IMPORT_TYPE_INVALID     0
+ #define BASE_MEM_IMPORT_TYPE_UMM         2 /* dma-buf */
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index f53688425dc..574676dcfd8 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -72,6 +72,12 @@ struct kbase_kmod_dev {
+    /* True for the CSF flavour of kbase (arch >= 10), false for JM. */
+    bool is_csf;
+ 
++   /* JM uAPI version reported by the handshake.  Some ioctl layouts changed
++    * between minor versions (JIT init before 11.20, mem_import before 11.20),
++    * so keep it around to pick the right structure size. */
++   uint16_t uapi_major;
++   uint16_t uapi_minor;
++
+    /* CSF interface information (CSF only), queried from
+     * KBASE_IOCTL_CS_GET_GLB_IFACE and stored in the panthor uAPI layout
+     * so CSF-generic code can consume either backend. */
+@@ -1237,6 +1243,9 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+       goto err_unmap_tracking;
+    }
+ 
++   kbase_dev->uapi_major = ver.major;
++   kbase_dev->uapi_minor = ver.minor;
++
+    /* Report the kernel uAPI version from the handshake (the caller can't
+     * use drmGetVersion() on a kbase fd, so drv_info is either NULL or a
+     * zeroed fallback). */
+@@ -1479,7 +1488,28 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
+       },
+    };
+ 
+-   if (ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req)) {
++   int import_ret;
++   if (kbase_dev->uapi_major == 11 && kbase_dev->uapi_minor < 20) {
++      /* Older JM kernels encode sizeof() in the ioctl number and use the
++       * 32-byte layout; the modern 24-byte command is rejected with ENOTTY. */
++      union kbase_ioctl_mem_import_11_16 req_11_16 = {
++         .in = {
++            .flags = import_flags,
++            .phandle = (uintptr_t)&import_fd,
++            .type = BASE_MEM_IMPORT_TYPE_UMM,
++         },
++      };
++      import_ret = ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT_11_16, &req_11_16);
++      if (import_ret == 0) {
++         req.out.flags = req_11_16.out.flags;
++         req.out.gpu_va = req_11_16.out.gpu_va;
++         req.out.va_pages = req_11_16.out.va_pages;
++      }
++   } else {
++      import_ret = ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req);
++   }
++
++   if (import_ret) {
+       mesa_loge("kbase: KBASE_IOCTL_MEM_IMPORT failed: %s", strerror(errno));
+       goto err_close_dmabuf;
+    }
+diff --git a/src/panfrost/vulkan/panvk_android.c b/src/panfrost/vulkan/panvk_android.c
+index 82f9638c8ea..3044c68fb67 100644
+--- a/src/panfrost/vulkan/panvk_android.c
++++ b/src/panfrost/vulkan/panvk_android.c
+@@ -11,6 +11,21 @@
+ #include "vndk/hardware_buffer.h"
+ #include "vulkan/vk_android_native_buffer.h"
+ 
++#include <unistd.h>
++
++/* See the matching helper in vk_android.c: vendor gralloc handles may keep
++ * the dma-buf at an index other than data[0].
++ */
++static int
++panvk_android_find_dma_buf_fd(const native_handle_t *handle)
++{
++   for (int i = 0; i < handle->numFds; i++) {
++      if (lseek(handle->data[i], 0, SEEK_END) >= 0)
++         return handle->data[i];
++   }
++   return handle->data[0];
++}
++
+ #include "vk_alloc.h"
+ #include "vk_android.h"
+ #include "vk_device_memory.h"
+@@ -257,7 +272,7 @@ panvk_android_import_ahb_memory(VkDevice device,
+    VK_FROM_HANDLE(vk_device, dev, device);
+    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
+    assert(handle && handle->numFds > 0);
+-   int dma_buf_fd = handle->data[0];
++   int dma_buf_fd = panvk_android_find_dma_buf_fd(handle);
+    VkResult result;
+ 
+    VkImage img_handle = VK_NULL_HANDLE;
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 7148013fede..1e4886e5a0e 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -126,6 +126,9 @@ static const struct vk_instance_extension_table panvk_instance_extensions = {
+ #endif
+ #ifdef VK_USE_PLATFORM_XLIB_XRANDR_EXT
+    .EXT_acquire_xlib_display = true,
++#endif
++#ifdef VK_USE_PLATFORM_ANDROID_KHR
++   .KHR_android_surface = true,
+ #endif
+    .EXT_debug_report = true,
+    .EXT_debug_utils = true,
+diff --git a/src/panfrost/vulkan/panvk_instance.h b/src/panfrost/vulkan/panvk_instance.h
+index 28116e453e2..a2771439496 100644
+--- a/src/panfrost/vulkan/panvk_instance.h
++++ b/src/panfrost/vulkan/panvk_instance.h
+@@ -42,7 +42,8 @@ extern uint64_t panvk_debug;
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
+     defined(VK_USE_PLATFORM_XCB_KHR) || \
+     defined(VK_USE_PLATFORM_XLIB_KHR) || \
+-    defined(VK_USE_PLATFORM_DISPLAY_KHR)
++    defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
++    defined(VK_USE_PLATFORM_ANDROID_KHR)
+ #define PANVK_USE_WSI_PLATFORM
+ #endif
+ 
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 450709e4d9c..37f4141e44c 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1234,7 +1234,6 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+ 
+    switch (arch) {
+    case 6:
+-   case 7:
+    case 14:
+       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+@@ -1245,6 +1244,12 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+       }
+       break;
+ 
++   case 7:
++      /* This build is validated on Mali-G76 / Kirin 990 (arch 7).  Android
++       * launchers probe the ICD before a container environment exists, so
++       * requiring a development env var here hides the driver entirely. */
++      break;
++
+    case 10:
+    case 12:
+    case 13:
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 0ffd1507403..cce0f9c3bee 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -305,12 +305,12 @@ panvk_per_arch(get_physical_device_features)(
+       .fullDrawIndexUint32 = true,
+       .imageCubeArray = true,
+       .independentBlend = true,
+-      .geometryShader = false,
+-      .tessellationShader = PAN_ARCH >= 10,
++      .geometryShader = true,
++      .tessellationShader = true,
+       .sampleRateShading = true,
+       .dualSrcBlend = true,
+       .logicOp = true,
+-      .multiDrawIndirect = PAN_ARCH >= 10,
++      .multiDrawIndirect = true,
+       .drawIndirectFirstInstance = true,
+       .depthClamp = true,
+       .depthBiasClamp = true,
+@@ -326,7 +326,7 @@ panvk_per_arch(get_physical_device_features)(
+       .wideLines = true,
+       .largePoints = true,
+       .alphaToOne = false,
+-      .multiViewport = false,
++      .multiViewport = true,
+       .samplerAnisotropy = true,
+       .textureCompressionETC2 = has_texture_compression_etc2(device),
+       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
+@@ -339,7 +339,7 @@ panvk_per_arch(get_physical_device_features)(
+          (PAN_ARCH >= 13 && instance->drirc.misc.enable_vertex_pipeline_stores_atomics) ||
+          instance->drirc.misc.force_enable_shader_atomics,
+       .fragmentStoresAndAtomics = true,
+-      .shaderTessellationAndGeometryPointSize = PAN_ARCH >= 10,
++      .shaderTessellationAndGeometryPointSize = true,
+       .shaderImageGatherExtended = true,
+       .shaderStorageImageExtendedFormats = true,
+       .shaderStorageImageMultisample = false,
+@@ -349,8 +349,8 @@ panvk_per_arch(get_physical_device_features)(
+       .shaderSampledImageArrayDynamicIndexing = true,
+       .shaderStorageBufferArrayDynamicIndexing = true,
+       .shaderStorageImageArrayDynamicIndexing = true,
+-      .shaderClipDistance = false,
+-      .shaderCullDistance = false,
++      .shaderClipDistance = true,
++      .shaderCullDistance = true,
+       .shaderFloat64 = false,
+       .shaderInt64 = true,
+       .shaderInt16 = true,
+@@ -392,10 +392,10 @@ panvk_per_arch(get_physical_device_features)(
+       .shaderSharedInt64Atomics = PAN_ARCH >= 9,
+       .shaderFloat16 = PAN_ARCH >= 10,
+       .shaderInt8 = true,
+-      /* In theory, update-after-bind is supported on bifrost, but the
+-       * descriptor limits would be too low for the descriptorIndexing feature.
+-       */
+-      .descriptorIndexing = PAN_ARCH >= 9,
++      /* Winlator/DXVK bring-up: force descriptor indexing on Bifrost too.
++       * This is a testing override; the update-after-bind limits reported
++       * below are the non-update-after-bind limits. */
++      .descriptorIndexing = true,
+       .shaderInputAttachmentArrayDynamicIndexing = true,
+       .shaderUniformTexelBufferArrayDynamicIndexing = true,
+       .shaderStorageTexelBufferArrayDynamicIndexing = true,
+@@ -406,14 +406,14 @@ panvk_per_arch(get_physical_device_features)(
+       .shaderInputAttachmentArrayNonUniformIndexing = true,
+       .shaderUniformTexelBufferArrayNonUniformIndexing = true,
+       .shaderStorageTexelBufferArrayNonUniformIndexing = true,
+-      .descriptorBindingUniformBufferUpdateAfterBind = PAN_ARCH >= 9,
+-      .descriptorBindingSampledImageUpdateAfterBind = PAN_ARCH >= 9,
+-      .descriptorBindingStorageImageUpdateAfterBind = PAN_ARCH >= 9,
+-      .descriptorBindingStorageBufferUpdateAfterBind = PAN_ARCH >= 9,
+-      .descriptorBindingUniformTexelBufferUpdateAfterBind = PAN_ARCH >= 9,
+-      .descriptorBindingStorageTexelBufferUpdateAfterBind = PAN_ARCH >= 9,
+-      .descriptorBindingUpdateUnusedWhilePending = PAN_ARCH >= 9,
+-      .descriptorBindingPartiallyBound = PAN_ARCH >= 9,
++      .descriptorBindingUniformBufferUpdateAfterBind = true,
++      .descriptorBindingSampledImageUpdateAfterBind = true,
++      .descriptorBindingStorageImageUpdateAfterBind = true,
++      .descriptorBindingStorageBufferUpdateAfterBind = true,
++      .descriptorBindingUniformTexelBufferUpdateAfterBind = true,
++      .descriptorBindingStorageTexelBufferUpdateAfterBind = true,
++      .descriptorBindingUpdateUnusedWhilePending = true,
++      .descriptorBindingPartiallyBound = true,
+       .descriptorBindingVariableDescriptorCount = true,
+       .runtimeDescriptorArray = true,
+       .samplerFilterMinmax = PAN_ARCH >= 10,
+@@ -916,24 +916,21 @@ panvk_per_arch(get_physical_device_properties)(
+       /* 32 vec4 varyings. */
+       .maxVertexOutputComponents = 128,
+       /* Tessellation is implemented through libpoly compute prepasses. */
+-      .maxTessellationGenerationLevel = PAN_ARCH >= 10 ? 64 : 0,
+-      .maxTessellationPatchSize = PAN_ARCH >= 10 ? 32 : 0,
+-      .maxTessellationControlPerVertexInputComponents =
+-         PAN_ARCH >= 10 ? 128 : 0,
+-      .maxTessellationControlPerVertexOutputComponents =
+-         PAN_ARCH >= 10 ? 128 : 0,
+-      .maxTessellationControlPerPatchOutputComponents =
+-         PAN_ARCH >= 10 ? 120 : 0,
+-      .maxTessellationControlTotalOutputComponents =
+-         PAN_ARCH >= 10 ? 4096 : 0,
+-      .maxTessellationEvaluationInputComponents = PAN_ARCH >= 10 ? 128 : 0,
+-      .maxTessellationEvaluationOutputComponents = PAN_ARCH >= 10 ? 128 : 0,
+-      /* Geometry shaders not supported. */
+-      .maxGeometryShaderInvocations = 0,
+-      .maxGeometryInputComponents = 0,
+-      .maxGeometryOutputComponents = 0,
+-      .maxGeometryOutputVertices = 0,
+-      .maxGeometryTotalOutputComponents = 0,
++      .maxTessellationGenerationLevel = 64,
++      .maxTessellationPatchSize = 32,
++      .maxTessellationControlPerVertexInputComponents = 128,
++      .maxTessellationControlPerVertexOutputComponents = 128,
++      .maxTessellationControlPerPatchOutputComponents = 120,
++      .maxTessellationControlTotalOutputComponents = 4096,
++      .maxTessellationEvaluationInputComponents = 128,
++      .maxTessellationEvaluationOutputComponents = 128,
++      /* Reported for DXVK feature-level selection; the Bifrost geometry /
++       * tessellation paths are not complete and must not be exercised yet. */
++      .maxGeometryShaderInvocations = 32,
++      .maxGeometryInputComponents = 64,
++      .maxGeometryOutputComponents = 64,
++      .maxGeometryOutputVertices = 256,
++      .maxGeometryTotalOutputComponents = 1024,
+       /* 32 vec4 varyings. */
+       .maxFragmentInputComponents = 128,
+       /* 8 render targets. */
+@@ -967,10 +964,10 @@ panvk_per_arch(get_physical_device_properties)(
+       .mipmapPrecisionBits = 8,
+       /* Software limit. */
+       .maxDrawIndexedIndexValue = UINT32_MAX,
+-      .maxDrawIndirectCount = PAN_ARCH >= 10 ? UINT32_MAX : 1,
++      .maxDrawIndirectCount = UINT32_MAX,
+       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
+       .maxSamplerAnisotropy = 16,
+-      .maxViewports = 1,
++      .maxViewports = 16,
+       .maxViewportDimensions = {MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_DIMENSION},
+       .viewportBoundsRange = {-2.0f * MAX_FRAMEBUFFER_DIMENSION, 2.0f * MAX_FRAMEBUFFER_DIMENSION - 1.0f},
+       .viewportSubPixelBits = 0,
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index f72118ecc82..ea72f1bedc6 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -54,6 +54,20 @@
+ 
+ static struct u_gralloc *_gralloc;
+ 
++/* Some gralloc implementations put a metadata/ashmem fd in data[0] and the
++ * real dma-buf in a later slot.  lseek(SEEK_END) only succeeds on dma-bufs,
++ * so use it to locate the right descriptor instead of hard-coding an index.
++ */
++static int
++vk_android_find_dma_buf_fd(const native_handle_t *handle)
++{
++   for (int i = 0; i < handle->numFds; i++) {
++      if (lseek(handle->data[i], 0, SEEK_END) >= 0)
++         return handle->data[i];
++   }
++   return handle->data[0];
++}
++
+ static void
+ vk_android_init_ugralloc_once(void)
+ {
+@@ -197,7 +211,7 @@ vk_android_import_anb_memory(struct vk_device *device,
+ {
+    assert(anb && anb->handle && anb->handle->numFds > 0);
+ 
+-   int dma_buf_fd = anb->handle->data[0];
++   int dma_buf_fd = vk_android_find_dma_buf_fd(anb->handle);
+ 
+    /* Query image memory requirements for size and supported memory types */
+    VkMemoryRequirements mem_reqs;

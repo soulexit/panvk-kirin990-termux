@@ -1,0 +1,560 @@
+From adfed35a4910cbbe32446f639e340ae6d727422c Mon Sep 17 00:00:00 2001
+From: panvk <panvk@local>
+Date: Wed, 21 Oct 2026 21:20:13 +0300
+Subject: [PATCH panvk-kirin990 22/23] panvk/jm: add CPU-side diagnostic
+ counters
+
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c  |   6 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c    |  30 +++++
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   | 109 ++++++++++++++++++
+ src/panfrost/vulkan/panvk_instance.c          |   3 +
+ src/panfrost/vulkan/panvk_jm_diag.h           |  46 ++++++++
+ src/panfrost/vulkan/panvk_vX_cmd_desc_state.c |   7 ++
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c       |  11 ++
+ .../vulkan/panvk_vX_cmd_push_constant.c       |   6 +
+ src/panfrost/vulkan/panvk_vX_descriptor_set.c |   6 +
+ src/panfrost/vulkan/panvk_vX_device.c         |   5 +
+ 10 files changed, 229 insertions(+)
+ create mode 100644 src/panfrost/vulkan/panvk_jm_diag.h
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index 9f5323ad67a..d81d9eda890 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -22,6 +22,7 @@
+ #include "panvk_device.h"
+ #include "panvk_entrypoints.h"
+ #include "panvk_instance.h"
++#include "panvk_jm_diag.h"
+ #include "panvk_meta.h"
+ #include "panvk_physical_device.h"
+ #include "panvk_priv_bo.h"
+@@ -347,6 +348,8 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    /* Caches are flushed/invalidated at batch boundaries for now, nothing to do
+     * for memory barriers assuming we implement barriers with the creation of a
+     * new batch.
+@@ -357,6 +360,9 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
+       panvk_per_arch(cmd_open_batch)(cmdbuf);
+    }
++
++   panvk_jm_diag_end(&panvk_jm_diag.barrier_ns, &panvk_jm_diag.barrier_count,
++                     _diag_t0);
+ }
+ 
+ static void
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 289b0415c55..e629957e978 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -24,6 +24,7 @@
+ #include "panvk_image.h"
+ #include "panvk_image_view.h"
+ #include "panvk_instance.h"
++#include "panvk_jm_diag.h"
+ #include "panvk_meta.h"
+ #include "panvk_priv_bo.h"
+ #include "panvk_shader.h"
+@@ -1776,6 +1777,8 @@ panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+    if (instanceCount == 0 || vertexCount == 0)
+       return;
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    /* gl_BaseVertexARB is a signed integer, and it should expose the value of
+     * firstVertex in a non-indexed draw. */
+    assert(firstVertex < INT32_MAX);
+@@ -1799,6 +1802,9 @@ panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+    };
+ 
+    panvk_cmd_draw(cmdbuf, &draw);
++
++   panvk_jm_diag_end(&panvk_jm_diag.draw_ns, &panvk_jm_diag.draw_count,
++                     _diag_t0);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1812,6 +1818,8 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
+    if (instanceCount == 0 || indexCount == 0)
+       return;
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    /* gl_BaseInstance is a signed integer, and it should expose the value of
+     * firstInstnace. */
+    assert(firstInstance < INT32_MAX);
+@@ -1841,6 +1849,9 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
+    };
+ 
+    panvk_cmd_draw_indirect(cmdbuf, &draw);
++
++   panvk_jm_diag_end(&panvk_jm_diag.draw_ns, &panvk_jm_diag.draw_count,
++                     _diag_t0);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1857,6 +1868,8 @@ panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
+    /* We cannot support arbitrary draw count on JM */
+    assert(drawCount == 1);
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    struct panvk_draw_data draw = {
+       .info = {
+          .indirect.buffer_dev_addr = panvk_buffer_gpu_ptr(buffer, offset),
+@@ -1867,6 +1880,9 @@ panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
+    };
+ 
+    panvk_cmd_draw_indirect(cmdbuf, &draw);
++
++   panvk_jm_diag_end(&panvk_jm_diag.draw_ns, &panvk_jm_diag.draw_count,
++                     _diag_t0);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1889,6 +1905,8 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
+    /* We cannot support arbitrary draw count on JM */
+    assert(drawCount == 1);
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    struct panvk_draw_data draw = {
+       .info = {
+          .index = panvk_draw_info_index(cmdbuf, 0),
+@@ -1900,6 +1918,9 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
+    };
+ 
+    panvk_cmd_draw_indirect(cmdbuf, &draw);
++
++   panvk_jm_diag_end(&panvk_jm_diag.draw_ns, &panvk_jm_diag.draw_count,
++                     _diag_t0);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1907,6 +1928,7 @@ panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
+                                   const VkRenderingInfo *pRenderingInfo)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
+    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
+    bool resuming = pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT;
+ 
+@@ -1928,6 +1950,9 @@ panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
+ 
+    if (!cmdbuf->cur_batch)
+       panvk_per_arch(cmd_open_batch)(cmdbuf);
++
++   panvk_jm_diag_end(&panvk_jm_diag.render_ns, &panvk_jm_diag.render_count,
++                     _diag_t0);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1935,6 +1960,8 @@ panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    if (!(cmdbuf->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT)) {
+       const struct pan_fb_load *fb_load = &cmdbuf->state.gfx.render.fb.load;
+       bool always_load = fb_load->z.always || fb_load->s.always;
+@@ -1952,4 +1979,7 @@ panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
+       cmdbuf->cur_batch = NULL;
+       panvk_per_arch(cmd_meta_resolve_attachments)(cmdbuf);
+    }
++
++   panvk_jm_diag_end(&panvk_jm_diag.render_ns, &panvk_jm_diag.render_count,
++                     _diag_t0);
+ }
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index ba688ca2010..90aad17efe9 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -22,6 +22,7 @@
+ #include "panvk_instance.h"
+ #include "panvk_physical_device.h"
+ #include "panvk_priv_bo.h"
++#include "panvk_jm_diag.h"
+ #include "panvk_queue.h"
+ 
+ #include "kmod/kbase_kmod.h"
+@@ -37,6 +38,7 @@
+ #include "drm-uapi/mali_kbase_ioctl.h"
+ #include <fcntl.h>
+ #include <inttypes.h>
++#include <unistd.h>
+ #include <poll.h>
+ #include <pthread.h>
+ #include <stdarg.h>
+@@ -49,6 +51,7 @@
+  * storage, because the app's emulog does not capture driver stderr. */
+ static uint64_t jm_diag_submit_ns, jm_diag_wait_ns;
+ static uint64_t jm_diag_submit_max_ns, jm_diag_wait_max_ns;
++static uint64_t jm_diag_window_start_ns;
+ static unsigned jm_diag_submits, jm_diag_waits, jm_diag_atoms;
+ static unsigned jm_diag_atoms_max;
+ 
+@@ -100,6 +103,35 @@ panvk_jm_log(const char *fmt, ...)
+    pthread_mutex_unlock(&jm_log_lock);
+ }
+ 
++static unsigned
++jm_read_gpu_khz(void)
++{
++   static const char *paths[] = {
++      "/sys/class/misc/mali0/device/devfreq/ffb40000.mali/cur_freq",
++      "/sys/class/misc/mali0/device/cur_freq",
++      "/sys/class/misc/mali0/device/scaling_cur_freq",
++      "/sys/class/devfreq/ffb40000.mali/cur_freq",
++   };
++
++   for (unsigned i = 0; i < ARRAY_SIZE(paths); i++) {
++      char buf[64];
++      int fd = open(paths[i], O_RDONLY | O_CLOEXEC);
++      if (fd < 0)
++         continue;
++      ssize_t n = read(fd, buf, sizeof(buf) - 1);
++      close(fd);
++      if (n <= 0)
++         continue;
++      buf[n] = 0;
++      unsigned long v = strtoul(buf, NULL, 10);
++      if (v > 1000000)
++         v /= 1000;
++      return (unsigned)v;
++   }
++
++   return 0;
++}
++
+ /* Wait function installed on every output vk_sync.  It blocks on the
+  * kbase atom numbers stored in targets[]; all earlier atoms of the submit
+  * are ordered before the final one, so a single target is sufficient. */
+@@ -352,6 +384,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+       jm_diag_atoms_max = atom_count;
+ 
+    if (jm_diag_submits == 1) {
++      jm_diag_window_start_ns = t0;
+       mesa_logi("PanVK JM: async atom submission active (%u atoms)", atom_count);
+       panvk_jm_log("active: first submit %u atoms, %" PRIu64 " us\n",
+                    atom_count, dt / 1000);
+@@ -378,6 +411,82 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+                       ? (unsigned)(jm_diag_wait_ns / 1000 / jm_diag_waits)
+                       : 0,
+                    (unsigned)(jm_diag_wait_max_ns / 1000));
++      const uint64_t now = os_time_get_nano();
++      const uint64_t wall_ns =
++         jm_diag_window_start_ns ? now - jm_diag_window_start_ns : 0;
++
++      uint64_t draw_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.draw_ns, 0, memory_order_relaxed);
++      uint64_t draw_count = atomic_exchange_explicit(
++         &panvk_jm_diag.draw_count, 0, memory_order_relaxed);
++      uint64_t barrier_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.barrier_ns, 0, memory_order_relaxed);
++      uint64_t barrier_count = atomic_exchange_explicit(
++         &panvk_jm_diag.barrier_count, 0, memory_order_relaxed);
++      uint64_t render_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.render_ns, 0, memory_order_relaxed);
++      uint64_t render_count = atomic_exchange_explicit(
++         &panvk_jm_diag.render_count, 0, memory_order_relaxed);
++      uint64_t desc_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.desc_ns, 0, memory_order_relaxed);
++      uint64_t desc_count = atomic_exchange_explicit(
++         &panvk_jm_diag.desc_count, 0, memory_order_relaxed);
++      uint64_t update_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.update_ns, 0, memory_order_relaxed);
++      uint64_t update_count = atomic_exchange_explicit(
++         &panvk_jm_diag.update_count, 0, memory_order_relaxed);
++      uint64_t vbs_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.vbs_ns, 0, memory_order_relaxed);
++      uint64_t vbs_count = atomic_exchange_explicit(
++         &panvk_jm_diag.vbs_count, 0, memory_order_relaxed);
++      uint64_t ib_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.ib_ns, 0, memory_order_relaxed);
++      uint64_t ib_count = atomic_exchange_explicit(
++         &panvk_jm_diag.ib_count, 0, memory_order_relaxed);
++      uint64_t push_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.push_ns, 0, memory_order_relaxed);
++      uint64_t push_count = atomic_exchange_explicit(
++         &panvk_jm_diag.push_count, 0, memory_order_relaxed);
++      uint64_t present_ns = atomic_exchange_explicit(
++         &panvk_jm_diag.present_ns, 0, memory_order_relaxed);
++      uint64_t present_count = atomic_exchange_explicit(
++         &panvk_jm_diag.present_count, 0, memory_order_relaxed);
++      const unsigned gpu_khz = jm_read_gpu_khz();
++
++      panvk_jm_log("cpu wall_ms=%" PRIu64 " interval_us=%" PRIu64
++                   " draw_us=%" PRIu64 " draw_n=%" PRIu64
++                   " barrier_us=%" PRIu64 " barrier_n=%" PRIu64
++                   " render_us=%" PRIu64 " render_n=%" PRIu64
++                   " desc_us=%" PRIu64 " desc_n=%" PRIu64
++                   " update_us=%" PRIu64 " update_n=%" PRIu64
++                   " vbs_us=%" PRIu64 " vbs_n=%" PRIu64
++                   " ib_us=%" PRIu64 " ib_n=%" PRIu64
++                   " push_us=%" PRIu64 " push_n=%" PRIu64
++                   " present_us=%" PRIu64 " present_n=%" PRIu64
++                   " gpu_khz=%u\n",
++                   wall_ns / 1000000,
++                   wall_ns / 1000 / jm_diag_submits,
++                   draw_ns / 1000 / jm_diag_submits,
++                   draw_count / jm_diag_submits,
++                   barrier_ns / 1000 / jm_diag_submits,
++                   barrier_count / jm_diag_submits,
++                   render_ns / 1000 / jm_diag_submits,
++                   render_count / jm_diag_submits,
++                   desc_ns / 1000 / jm_diag_submits,
++                   desc_count / jm_diag_submits,
++                   update_ns / 1000 / jm_diag_submits,
++                   update_count / jm_diag_submits,
++                   vbs_ns / 1000 / jm_diag_submits,
++                   vbs_count / jm_diag_submits,
++                   ib_ns / 1000 / jm_diag_submits,
++                   ib_count / jm_diag_submits,
++                   push_ns / 1000 / jm_diag_submits,
++                   push_count / jm_diag_submits,
++                   present_ns / 1000 / jm_diag_submits,
++                   present_count / jm_diag_submits,
++                   gpu_khz);
++      jm_diag_window_start_ns = now;
++
+       jm_diag_submit_ns = jm_diag_wait_ns = 0;
+       jm_diag_submit_max_ns = jm_diag_wait_max_ns = 0;
+       jm_diag_submits = jm_diag_waits = jm_diag_atoms = jm_diag_atoms_max = 0;
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 1e4886e5a0e..a7b1c90093b 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -28,6 +28,9 @@
+ #include "panvk_instance.h"
+ #include "panvk_macros.h"
+ #include "panvk_physical_device.h"
++#include "panvk_jm_diag.h"
++
++struct panvk_jm_diag panvk_jm_diag;
+ 
+ #ifdef HAVE_VALGRIND
+ #include <memcheck.h>
+diff --git a/src/panfrost/vulkan/panvk_jm_diag.h b/src/panfrost/vulkan/panvk_jm_diag.h
+new file mode 100644
+index 00000000000..9a043b705ab
+--- /dev/null
++++ b/src/panfrost/vulkan/panvk_jm_diag.h
+@@ -0,0 +1,46 @@
++#ifndef PANVK_JM_DIAG_H
++#define PANVK_JM_DIAG_H
++
++#include <stdatomic.h>
++#include <stdint.h>
++
++#include "util/os_time.h"
++
++struct panvk_jm_diag {
++   _Atomic uint64_t draw_ns;
++   _Atomic uint64_t draw_count;
++   _Atomic uint64_t barrier_ns;
++   _Atomic uint64_t barrier_count;
++   _Atomic uint64_t render_ns;
++   _Atomic uint64_t render_count;
++   _Atomic uint64_t desc_ns;
++   _Atomic uint64_t desc_count;
++   _Atomic uint64_t update_ns;
++   _Atomic uint64_t update_count;
++   _Atomic uint64_t vbs_ns;
++   _Atomic uint64_t vbs_count;
++   _Atomic uint64_t ib_ns;
++   _Atomic uint64_t ib_count;
++   _Atomic uint64_t push_ns;
++   _Atomic uint64_t push_count;
++   _Atomic uint64_t present_ns;
++   _Atomic uint64_t present_count;
++};
++
++extern struct panvk_jm_diag panvk_jm_diag;
++
++static inline uint64_t
++panvk_jm_diag_begin(void)
++{
++   return os_time_get_nano();
++}
++
++static inline void
++panvk_jm_diag_end(_Atomic uint64_t *ns, _Atomic uint64_t *count, uint64_t t0)
++{
++   uint64_t dt = os_time_get_nano() - t0;
++   atomic_fetch_add_explicit(ns, dt, memory_order_relaxed);
++   atomic_fetch_add_explicit(count, 1, memory_order_relaxed);
++}
++
++#endif /* PANVK_JM_DIAG_H */
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+index 6beab5f62c7..b11975a1bae 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+@@ -25,6 +25,8 @@
+ #include "vk_command_buffer.h"
+ #include "vk_command_pool.h"
+ 
++#include "panvk_jm_diag.h"
++
+ static void
+ cmd_desc_state_bind_sets(struct panvk_descriptor_state *desc_state,
+                          const VkBindDescriptorSetsInfoKHR *info)
+@@ -349,6 +351,8 @@ panvk_per_arch(CmdBindDescriptorSets2KHR)(
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    /* TODO: Invalidate only if the shader tables are disturbed */
+    if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
+       cmd_desc_state_bind_sets(&cmdbuf->state.gfx.desc_state,
+@@ -363,6 +367,9 @@ panvk_per_arch(CmdBindDescriptorSets2KHR)(
+ 
+       compute_state_set_dirty(cmdbuf, DESC_STATE);
+    }
++
++   panvk_jm_diag_end(&panvk_jm_diag.desc_ns, &panvk_jm_diag.desc_count,
++                     _diag_t0);
+ }
+ 
+ static void
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 11f03dd0d20..a23562257bc 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -8,6 +8,7 @@
+ #include "panvk_cmd_buffer.h"
+ #include "panvk_device_memory.h"
+ #include "panvk_entrypoints.h"
++#include "panvk_jm_diag.h"
+ 
+ #include "pan_desc.h"
+ #include "pan_util.h"
+@@ -983,6 +984,8 @@ panvk_per_arch(CmdBindVertexBuffers2)(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    assert(firstBinding + bindingCount <= MAX_VBS);
+ 
+    if (pStrides) {
+@@ -1007,6 +1010,9 @@ panvk_per_arch(CmdBindVertexBuffers2)(VkCommandBuffer commandBuffer,
+    cmdbuf->state.gfx.vb.count =
+       MAX2(cmdbuf->state.gfx.vb.count, firstBinding + bindingCount);
+    gfx_state_set_dirty(cmdbuf, VB);
++
++   panvk_jm_diag_end(&panvk_jm_diag.vbs_ns, &panvk_jm_diag.vbs_count,
++                     _diag_t0);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1017,6 +1023,8 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    VK_FROM_HANDLE(panvk_buffer, buf, buffer);
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    if (buf) {
+       cmdbuf->state.gfx.ib.size = panvk_buffer_range(buf, offset, size);
+       assert(cmdbuf->state.gfx.ib.size <= UINT32_MAX);
+@@ -1030,4 +1038,7 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
+       cmdbuf->state.gfx.ib.dev_addr = PAN_ARCH >= 10 ? 0x1000 : 0;
+    }
+    cmdbuf->state.gfx.ib.index_size = vk_index_type_to_bytes(indexType);
++
++   panvk_jm_diag_end(&panvk_jm_diag.ib_ns, &panvk_jm_diag.ib_count,
++                     _diag_t0);
+ }
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+index 080fac61dd5..84214f99033 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+@@ -6,6 +6,7 @@
+ #include "panvk_cmd_alloc.h"
+ #include "panvk_cmd_buffer.h"
+ #include "panvk_entrypoints.h"
++#include "panvk_jm_diag.h"
+ 
+ static VkResult
+ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
+@@ -100,6 +101,8 @@ panvk_per_arch(CmdPushConstants2KHR)(
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    if (pPushConstantsInfo->stageFlags &
+        (VK_SHADER_STAGE_VERTEX_BIT |
+         VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+@@ -116,4 +119,7 @@ panvk_per_arch(CmdPushConstants2KHR)(
+       (uint8_t *)cmdbuf->state.push_constants.data + pPushConstantsInfo->offset;
+ 
+    memcpy(data, pPushConstantsInfo->pValues, pPushConstantsInfo->size);
++
++   panvk_jm_diag_end(&panvk_jm_diag.push_ns, &panvk_jm_diag.push_count,
++                     _diag_t0);
+ }
+diff --git a/src/panfrost/vulkan/panvk_vX_descriptor_set.c b/src/panfrost/vulkan/panvk_vX_descriptor_set.c
+index 4df1003051e..cf5edc25457 100644
+--- a/src/panfrost/vulkan/panvk_vX_descriptor_set.c
++++ b/src/panfrost/vulkan/panvk_vX_descriptor_set.c
+@@ -28,6 +28,7 @@
+ #include "panvk_descriptor_set.h"
+ #include "panvk_descriptor_set_layout.h"
+ #include "panvk_device.h"
++#include "panvk_jm_diag.h"
+ #include "panvk_entrypoints.h"
+ #include "panvk_image.h"
+ #include "panvk_image_view.h"
+@@ -815,6 +816,8 @@ panvk_per_arch(UpdateDescriptorSets)(
+    const VkWriteDescriptorSet *pDescriptorWrites, uint32_t descriptorCopyCount,
+    const VkCopyDescriptorSet *pDescriptorCopies)
+ {
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
++
+    for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+       VK_FROM_HANDLE(panvk_descriptor_set, set, pDescriptorWrites[i].dstSet);
+ 
+@@ -838,6 +841,9 @@ panvk_per_arch(UpdateDescriptorSets)(
+ 
+       panvk_per_arch(descriptor_set_flush)(set);
+    }
++
++   panvk_jm_diag_end(&panvk_jm_diag.update_ns, &panvk_jm_diag.update_count,
++                     _diag_t0);
+ }
+ 
+ void
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index ff3b640c50b..be5eef86c63 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -23,6 +23,7 @@
+ #include "panvk_cmd_draw.h"
+ #include "panvk_entrypoints.h"
+ #include "panvk_instance.h"
++#include "panvk_jm_diag.h"
+ #include "panvk_macros.h"
+ #include "panvk_physical_device.h"
+ #include "panvk_precomp_cache.h"
+@@ -83,8 +84,12 @@ panvk_kbase_copy_sync_payloads(struct vk_device *device,
+       return vk_sync_signal_many(device, signal_count, signals);
+    }
+ 
++   uint64_t _diag_t0 = panvk_jm_diag_begin();
+    VkResult result = vk_sync_wait_many(device, wait_count, waits,
+                                        VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
++   if (result == VK_SUCCESS)
++      panvk_jm_diag_end(&panvk_jm_diag.present_ns,
++                        &panvk_jm_diag.present_count, _diag_t0);
+    if (result != VK_SUCCESS)
+       return result;
+ 

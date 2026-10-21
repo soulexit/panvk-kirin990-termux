@@ -1,0 +1,112 @@
+From efe6fd8df954320058c552796703ecc5c50a5a1d Mon Sep 17 00:00:00 2001
+From: OpenCode Build <build@localhost>
+Date: Wed, 21 Oct 2026 16:41:11 +0300
+Subject: [PATCH panvk-kirin990 20/23] panvk: run kbase JM submissions on the
+ runtime thread
+
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 40 +++++++++++++++------
+ src/panfrost/vulkan/panvk_vX_device.c       |  9 +++++
+ 2 files changed, 38 insertions(+), 11 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 3197c0fc5d9..ba688ca2010 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -28,6 +28,7 @@
+ 
+ #include "util/os_time.h"
+ 
++#include "vk_common_entrypoints.h"
+ #include "vk_drm_syncobj.h"
+ #include "vk_framebuffer.h"
+ #include "vk_sync.h"
+@@ -413,6 +414,19 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
+    queue->sync = 0;
+ 
+    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
++
++   /* Always run this queue with the submit thread.  The device-level
++    * threaded-submit mode is THREADED_ON_DEMAND so that the other queue
++    * families keep their existing immediate behaviour, but the GPU queue is
++    * the one that can block on the kbase atom table and must not block the
++    * application's render thread there.
++    */
++   result = vk_queue_enable_submit_thread(&queue->vk);
++   if (result != VK_SUCCESS) {
++      vk_queue_finish(&queue->vk);
++      goto err_free_queue;
++   }
++
+    *out_queue = &queue->vk;
+    return VK_SUCCESS;
+ 
+@@ -427,14 +441,22 @@ void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
+    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
+ 
+    /* The application is not required to call vkQueueWaitIdle before
+-    * destroying the device, but we must not free BOs still referenced by
+-    * in-flight atoms.  Give the GPU a bounded amount of time to finish. */
++    * destroying the device.  In threaded mode the submit worker may still
++    * hold submissions that have not reached kbase, so drain the runtime
++    * queue first; vk_common_QueueWaitIdle enqueues a signal behind all
++    * pending submits and waits for its atom. */
++   if (!vk_device_is_lost(&dev->vk))
++      (void)vk_common_QueueWaitIdle(vk_queue_to_handle(vk_queue));
++
++   vk_queue_finish(&queue->vk);
++
++   /* The worker is stopped and all submissions are in kbase now.  Give the
++    * GPU a bounded amount of time to finish before BOs are freed. */
+    if (queue->last_atom &&
+        !kbase_kmod_wait_atom(dev->kmod.dev, queue->last_atom, 2000000000ll))
+       mesa_logw("panvk: timed out draining queue atom %" PRIu64,
+                 queue->last_atom);
+ 
+-   vk_queue_finish(&queue->vk);
+    /* PATCH: no drm_syncobj to destroy */
+    vk_free(&dev->vk.alloc, queue);
+ }
+@@ -451,18 +473,14 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
+    VK_FROM_HANDLE(panvk_gpu_queue, queue, _queue);
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+ 
+-   /* we need to use vk_common_QueueWaitIdle if we ever go threaded */
+-   assert(queue->vk.submit.mode != VK_QUEUE_SUBMIT_MODE_THREADED);
+-
+    if (vk_device_is_lost(&dev->vk)) {
+       /* Check printf buffer one more time before exiting */
+       u_printf_with_ctx(stdout, &dev->printf.ctx);
+       return VK_ERROR_DEVICE_LOST;
+    }
+ 
+-   if (queue->last_atom &&
+-       !kbase_kmod_wait_atom(dev->kmod.dev, queue->last_atom, -1))
+-      return VK_ERROR_DEVICE_LOST;
+-
+-   return VK_SUCCESS;
++   /* The submit thread may still hold submissions that have not reached
++    * kbase, so a direct wait on queue->last_atom would miss them.  Enqueue a
++    * signal behind all pending submissions and wait for that. */
++   return vk_common_QueueWaitIdle(_queue);
+ }
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index c9ff8cbe637..ff3b640c50b 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -500,6 +500,15 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+    if (result != VK_SUCCESS)
+       goto err_free_dev;
+ 
++   /* On kbase JM the 255-entry atom-number table can fill while the GPU is
++    * still a frame or two behind.  Blocking the app's render thread inside
++    * vkQueueSubmit() serializes CPU frame preparation with the GPU and shows
++    * up as multi-10ms submit spikes.  The kbase sync type implements
++    * WAIT_PENDING and move, so the runtime can safely move submissions onto
++    * its worker thread and let the app keep preparing frames.
++    */
++   vk_device_enable_threaded_submit(&device->vk);
++
+    /* Must be done after vk_device_init() because this function memset(0) the
+     * whole struct.
+     */

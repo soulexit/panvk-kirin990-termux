@@ -1,0 +1,76 @@
+From 10cbdd39403c29d4d18dd2dafe83ff0e1fb19f8d Mon Sep 17 00:00:00 2001
+From: OpenCode Build <build@localhost>
+Date: Wed, 21 Oct 2026 21:51:18 +0300
+Subject: [PATCH panvk-kirin990 00/23] *** SUBJECT HERE ***
+
+*** BLURB HERE ***
+
+OpenCode Build (15):
+  apply: termux-android-detection-fixes.patch
+  apply: exec_init_order_fix.patch
+  apply: gpu_variant_fix.patch
+  apply: android_wsi_ahb_fixes.patch
+  apply: gpu_queue_kbase.patch
+  apply: wsi_present_sync_fix.patch
+  apply: winlator_wsi_sync_fixes.patch
+  build(termux): force qsort_r/memfd_create fallbacks on Android (device
+    lacks API30+/API36+ libc symbols)
+  build(termux): restrict panvk to JM archs (6,7) with kbase-only; CSF
+    needs panthor
+  build(termux): limit panvk entrypoint device-prefixes to built archs
+  build(termux): compile panthor kmod helpers for kbase-only panvk CSF
+    references
+  kbase: bring the JM backend up on a uAPI 11.16 kernel (Kirin 990)
+  panvk: Android-only Winlator/DXVK support for kbase 11.16 (G76)
+  panvk: report valid update-after-bind limits on forced Bifrost profile
+  panvk: run kbase JM submissions on the runtime thread
+
+PanVK kbase (1):
+  panvk: copy sync payloads in CPU on kbase
+
+PanVK kbase bring-up (1):
+  panvk: request linear swapchain buffers on Huawei gralloc
+
+panvk (2):
+  panvk/jm: add CPU-side diagnostic counters
+  panvk/jm: report diagnostic window totals
+
+panvk-luke (4):
+  panvk/jm: submit kbase atoms asynchronously with dependencies
+  panvk/jm: batch tiler+fragment atoms into one ioctl
+  panvk: add diagnostic no-wait present path
+  panvk: expose ROAA on Bifrost for ARMSX2 in-tile self-reads
+
+ include/drm-uapi/mali_kbase_ioctl.h           |  35 ++
+ include/vulkan/vk_android_native_buffer.h     |   2 +-
+ meson.build                                   |  30 +-
+ src/android_stub/hardware_stub.cpp            |   9 +-
+ src/panfrost/lib/kmod/kbase_kmod.c            | 572 +++++++++++++++++-
+ src/panfrost/lib/kmod/kbase_kmod.h            |  41 ++
+ src/panfrost/lib/kmod/meson.build             |   6 +-
+ src/panfrost/model/pan_model.c                |   2 +-
+ src/panfrost/vulkan/jm/panvk_queue.h          |   7 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c  |   6 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c    |  30 +
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   | 560 +++++++++++------
+ src/panfrost/vulkan/panvk_android.c           |  17 +-
+ src/panfrost/vulkan/panvk_image.c             |   4 +
+ src/panfrost/vulkan/panvk_instance.c          |   6 +
+ src/panfrost/vulkan/panvk_instance.h          |   3 +-
+ src/panfrost/vulkan/panvk_jm_diag.h           |  46 ++
+ src/panfrost/vulkan/panvk_physical_device.c   | 111 +++-
+ src/panfrost/vulkan/panvk_vX_cmd_desc_state.c |   7 +
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c       |  11 +
+ .../vulkan/panvk_vX_cmd_push_constant.c       |   6 +
+ src/panfrost/vulkan/panvk_vX_descriptor_set.c |   6 +
+ src/panfrost/vulkan/panvk_vX_device.c         |  65 ++
+ .../vulkan/panvk_vX_physical_device.c         | 154 +++--
+ src/util/detect_os.h                          |   2 +-
+ src/util/libsync.h                            |   2 +-
+ src/util/u_gralloc/u_gralloc_fallback.c       |  17 +
+ src/vulkan/meson.build                        |  23 +-
+ src/vulkan/runtime/vk_android.c               |  62 +-
+ src/vulkan/wsi/meson.build                    |   2 +-
+ 30 files changed, 1540 insertions(+), 304 deletions(-)
+ create mode 100644 src/panfrost/vulkan/panvk_jm_diag.h
+

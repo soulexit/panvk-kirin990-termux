@@ -1,0 +1,112 @@
+From d097871eb98465af16f2a6e6ef6cc87f268c4840 Mon Sep 17 00:00:00 2001
+From: panvk-luke <panvk-luke@localhost>
+Date: Wed, 21 Oct 2026 20:15:34 +0300
+Subject: [PATCH panvk-kirin990 21/23] panvk: expose ROAA on Bifrost for ARMSX2
+ in-tile self-reads
+
+ARMSX2 checks VK_EXT_rasterization_order_attachment_access and, when it is
+present, reads the live color attachment through subpass inputs and drops
+the per-primitive destination-read barriers. PanVK already has the Bifrost
+input-attachment path and it works on v7; only the extension/feature gate
+was v10+.
+
+Enable color ROAA on v7 for this pack.  Keep a runtime escape hatch for
+A/B testing: /sdcard/Android/data/com.armsx2.nightly/files/logs/panvk_no_roaa
+or PANVK_ROAA=0 disables it.  Depth/stencil ROAA remains v10+.
+---
+ .../vulkan/panvk_vX_physical_device.c         | 39 +++++++++++++++++--
+ 1 file changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index f955728d44f..aa864f122b6 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -9,7 +9,9 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <stdlib.h>
+ #include <sys/sysmacros.h>
++#include <unistd.h>
+ 
+ #include "git_sha1.h"
+ 
+@@ -33,6 +35,35 @@
+ #define RESERVED_UBO_COUNT                   6
+ #define MAX_INLINE_UNIFORM_BLOCK_DESCRIPTORS (32 - RESERVED_UBO_COUNT)
+ 
++/*
++ * ARMSX2 asks for VK_EXT_rasterization_order_attachment_access and, when
++ * present, uses in-tile input-attachment reads for destination reads instead
++ * of the per-primitive barrier/layout fallback.  PanVK already implements the
++ * Bifrost input-attachment path; upstream only advertises the extension on
++ * v10+ because the CSF path also programs the overlap flush explicitly.
++ *
++ * Keep this as a runtime experiment for now: enabled by default, with a
++ * file/env switch so a bad result can be ruled out without repacking.
++ */
++static bool
++panvk_v7_roaa_enabled(void)
++{
++   static int enabled = -1;
++
++   if (enabled < 0) {
++      const char *env = getenv("PANVK_ROAA");
++
++      if (env && env[0])
++         enabled = env[0] != '0';
++      else
++         enabled =
++            access("/sdcard/Android/data/com.armsx2.nightly/files/logs/panvk_no_roaa",
++                   F_OK) != 0;
++   }
++
++   return enabled;
++}
++
+ void
+ panvk_per_arch(get_physical_device_extensions)(
+    const struct panvk_physical_device *device,
+@@ -40,6 +71,7 @@ panvk_per_arch(get_physical_device_extensions)(
+    struct vk_device_extension_table *ext)
+ {
+    bool has_gralloc = vk_android_get_ugralloc() != NULL;
++   const bool roaa = PAN_ARCH < 10 && panvk_v7_roaa_enabled();
+ 
+    *ext = (struct vk_device_extension_table){
+       .KHR_8bit_storage = true,
+@@ -197,7 +229,7 @@ panvk_per_arch(get_physical_device_extensions)(
+       .EXT_primitive_topology_list_restart = true,
+       .EXT_provoking_vertex = true,
+       .EXT_queue_family_foreign = true,
+-      .EXT_rasterization_order_attachment_access = PAN_ARCH >= 10,
++      .EXT_rasterization_order_attachment_access = PAN_ARCH >= 10 || roaa,
+       .EXT_rgba10x6_formats = PAN_ARCH >= 11,
+       .EXT_robustness2 = PAN_ARCH >= 10,
+       .EXT_sampler_filter_minmax = PAN_ARCH >= 10,
+@@ -242,7 +274,7 @@ panvk_per_arch(get_physical_device_extensions)(
+       .ARM_shader_core_builtins = true,
+       .ARM_shader_core_properties = true,
+       .ARM_scheduling_controls = true,
+-      .ARM_rasterization_order_attachment_access = PAN_ARCH >= 10,
++      .ARM_rasterization_order_attachment_access = PAN_ARCH >= 10 || roaa,
+    };
+ }
+ 
+@@ -298,6 +330,7 @@ panvk_per_arch(get_physical_device_features)(
+     * Do not advertise sparse support there, otherwise CTS will exercise sparse
+     * binding paths that can only fail at submit time. */
+    bool has_sparse = PAN_ARCH >= 10 && !device->kbase_node_path[0];
++   const bool roaa = PAN_ARCH < 10 && panvk_v7_roaa_enabled();
+ 
+    *features = (struct vk_features){
+       /* Vulkan 1.0 */
+@@ -774,7 +807,7 @@ panvk_per_arch(get_physical_device_features)(
+ #endif
+ 
+       /* VK_EXT_rasterization_order_attachment_access */
+-      .rasterizationOrderColorAttachmentAccess = PAN_ARCH >= 10,
++      .rasterizationOrderColorAttachmentAccess = PAN_ARCH >= 10 || roaa,
+       .rasterizationOrderDepthAttachmentAccess = PAN_ARCH >= 10,
+       .rasterizationOrderStencilAttachmentAccess = PAN_ARCH >= 10,
+    };

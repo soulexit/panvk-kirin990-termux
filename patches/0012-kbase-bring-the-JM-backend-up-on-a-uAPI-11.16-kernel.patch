@@ -1,0 +1,279 @@
+From f361767e691e5d9e779e72f5b3f37a9b8a51b52f Mon Sep 17 00:00:00 2001
+From: OpenCode Build <build@localhost>
+Date: Mon, 19 Oct 2026 21:49:30 +0300
+Subject: [PATCH panvk-kirin990 12/23] kbase: bring the JM backend up on a uAPI
+ 11.16 kernel (Kirin 990)
+
+Tested on a Huawei Kirin 990 (Mali-G76 MC16, /dev/mali0, Android 10-era
+Bionic) whose kbase reports uAPI 11.16.  With these changes panvk creates
+a device, runs compute dispatches and renders the triangle smoke test
+deterministically.
+
+- meson: do not use pthread_{get,set}affinity_np on Android.  Bionic
+  declares it but only exports it from API 36; with a lower target API the
+  compiler emits a weak reference that is NULL at runtime, so the u_queue
+  worker-thread affinity setup crashed.  Fall back to the portable path.
+
+- kbase uAPI: add the pre-11.20 (16-byte) KBASE_IOCTL_MEM_JIT_INIT layout
+  and use it when the handshake reports major 11 / minor < 20.  The modern
+  24-byte ioctl number is rejected with ENOTTY on this kernel.  Reserve
+  4 GiB of JIT VA (the 128 GiB panfork value is rejected here).
+
+- JOB_SUBMIT: this 11.16 kernel validates atoms with the 11.19+ 56-byte
+  base_jd_atom_v2 stride (renderpass_id + padding[7]); 48 bytes fails with
+  EINVAL.  Submit a zero-filled 56-byte atom, report submit/poll/event
+  failures instead of silently ignoring them, and fix the dead
+  err_finish_queue label in the queue setup path.
+
+- coherency: do not advertise PAN_KMOD_BO_FLAG_WB_MMAP (cached CPU
+  mappings) by default.  CPU cache maintenance on this platform only
+  affects the issuing CPU, so a thread migrating between clusters can leave
+  stale lines for GPU->CPU readback and CPU->GPU uploads.  Host-visible
+  buffers are now mapped non-cacheable and behave as the advertised
+  HOST_COHERENT type, which makes readback deterministic without
+  vkInvalidateMappedMemoryRanges.  WB_MMAP and explicit cache maintenance
+  (routed through KBASE_IOCTL_MEM_SYNC) remain available with
+  PANVK_KBASE_ENABLE_WB_MMAP=1.
+---
+ include/drm-uapi/mali_kbase_ioctl.h         | 13 ++++
+ meson.build                                 |  8 ++-
+ src/panfrost/lib/kmod/kbase_kmod.c          | 66 +++++++++++++++------
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 36 ++++++++---
+ 4 files changed, 94 insertions(+), 29 deletions(-)
+
+diff --git a/include/drm-uapi/mali_kbase_ioctl.h b/include/drm-uapi/mali_kbase_ioctl.h
+index bac721e26f1..c0b110a8241 100644
+--- a/include/drm-uapi/mali_kbase_ioctl.h
++++ b/include/drm-uapi/mali_kbase_ioctl.h
+@@ -262,6 +262,19 @@ struct kbase_ioctl_mem_jit_init {
+ #define KBASE_IOCTL_MEM_JIT_INIT \
+    _IOW(KBASE_IOCTL_TYPE, 14, struct kbase_ioctl_mem_jit_init)
+ 
++/* Pre-11.20 ("11.5") JIT init layout: no phys_pages member.  Older kbase
++ * kernels (e.g. uAPI 11.16) only implement this 16-byte variant, so the
++ * ioctl number above (24-byte struct) is rejected with ENOTTY. */
++struct kbase_ioctl_mem_jit_init_11_5 {
++   __u64 va_pages;
++   __u8 max_allocations;
++   __u8 trim_level;
++   __u8 group_id;
++   __u8 padding[5];
++};
++#define KBASE_IOCTL_MEM_JIT_INIT_11_5 \
++   _IOW(KBASE_IOCTL_TYPE, 14, struct kbase_ioctl_mem_jit_init_11_5)
++
+ /* -----------------------------------------------------------------------
+  * CPU cache maintenance on a mapped region.
+  * ----------------------------------------------------------------------- */
+diff --git a/meson.build b/meson.build
+index ba94baaf2de..3fff9c47a8c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1849,7 +1849,13 @@ else
+ endif
+ if dep_thread.found()
+   pre_args += '-DHAVE_PTHREAD'
+-  if host_machine.system() != 'netbsd' and cc.has_function(
++  # Android's Bionic declares pthread_{get,set}affinity_np but only exports
++  # them from API 36. Before that the compiler emits weak undefined
++  # references, so cc.has_function() succeeds while the symbol resolves to
++  # NULL at runtime and calling it crashes (u_queue worker threads call
++  # util_set_current_thread_affinity()). Force the fallback on Android.
++  if host_machine.system() != 'netbsd' and not with_platform_android \
++     and cc.has_function(
+       'pthread_setaffinity_np',
+       dependencies : dep_thread,
+       prefix : '#include <pthread.h>',
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 5ea47c6e9e2..f53688425dc 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -373,15 +373,29 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
+     * granularity.  Newer pan_kmod derives the VM bitmap from device props. */
+    props->pgsize_bitmap = PAN_PGSIZE_4K;
+ 
+-   /* Supported BO flags. WB_MMAP is backed by BASE_MEM_CACHED_CPU and explicit
+-    * KBASE_IOCTL_MEM_SYNC operations in kbase_kmod_flush_bo_map_syncs().
++   /* Supported BO flags.
++    *
++    * WB_MMAP (BASE_MEM_CACHED_CPU) is disabled by default on kbase: cache
++    * maintenance is only guaranteed to affect the CPU that issues it, so a
++    * thread that migrates between clusters can leave stale cache lines
++    * behind for both GPU->CPU readback and CPU->GPU uploads.  Without cached
++    * CPU mappings the kernel maps host-visible buffers non-cacheable, which
++    * makes them behave as the HOST_COHERENT memory type claims and removes
++    * the need for vkFlush/InvalidateMappedMemoryRanges entirely.
++    *
++    * Set PANVK_KBASE_ENABLE_WB_MMAP=1 to opt back in for experiments; the
++    * backend then routes explicit cache maintenance through
++    * KBASE_IOCTL_MEM_SYNC by default.
+     */
+    props->supported_bo_flags = PAN_KMOD_BO_FLAG_EXECUTABLE |
+                                 PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
+                                 PAN_KMOD_BO_FLAG_NO_MMAP |
+-                                PAN_KMOD_BO_FLAG_WB_MMAP |
+                                 PAN_KMOD_BO_FLAG_GPU_UNCACHED |
+                                 PAN_KMOD_BO_FLAG_CSF_EVENT;
++
++   const char *enable_wb_mmap = getenv("PANVK_KBASE_ENABLE_WB_MMAP");
++   if (enable_wb_mmap && !strcmp(enable_wb_mmap, "1"))
++      props->supported_bo_flags |= PAN_KMOD_BO_FLAG_WB_MMAP;
+ }
+ 
+ /* -------------------------------------------------------------------------
+@@ -1184,14 +1198,29 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+     * KBASE_IOCTL_CS_TILER_HEAP_INIT fails with ENOMEM.  Parameters match
+     * panfork's.  Failure is non-fatal for enumeration but breaks tiler
+     * heaps, so warn. */
+-   struct kbase_ioctl_mem_jit_init jit_init = {
+-      .va_pages = 1ull << 20 /* PATCH: reduced from panfork's 1<<25 (~128GB VA) - testing if kernel 4.19 rejects oversized JIT VA request */,
+-      .max_allocations = 255,
+-      .phys_pages = 1ull << 20,
+-   };
+-   if (ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT, &jit_init)) {
+-      mesa_logw("kbase: KBASE_IOCTL_MEM_JIT_INIT failed: %s "
+-                "(tiler heap creation will not work)", strerror(errno));
++   if (ver.major == 11 && ver.minor < 20) {
++      /* Older JM kernels (uAPI < 11.20) use the 16-byte JIT layout without
++       * phys_pages; the 24-byte ioctl number is rejected with ENOTTY. */
++      struct kbase_ioctl_mem_jit_init_11_5 jit_init_11_5 = {
++         .va_pages = 1ull << 20,
++         .max_allocations = 255,
++      };
++      if (ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT_11_5, &jit_init_11_5)) {
++         mesa_logw("kbase: KBASE_IOCTL_MEM_JIT_INIT (11.5) failed: %s "
++                   "(tiler heap creation will not work)", strerror(errno));
++      }
++   } else {
++      /* Reserve 4 GiB of JIT VA rather than panfork's 128 GiB: the
++       * 4.19 kernel on this device rejects the larger request. */
++      struct kbase_ioctl_mem_jit_init jit_init = {
++         .va_pages = 1ull << 20,
++         .max_allocations = 255,
++         .phys_pages = 1ull << 20,
++      };
++      if (ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT, &jit_init)) {
++         mesa_logw("kbase: KBASE_IOCTL_MEM_JIT_INIT failed: %s "
++                   "(tiler heap creation will not work)", strerror(errno));
++      }
+    }
+ 
+    /* Initialise the EXEC_VA zone so that GPU-executable allocations
+@@ -1215,15 +1244,14 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+       .version = { .major = ver.major, .minor = ver.minor },
+    };
+ 
+-   /* kbase traditionally routes cached BO synchronization through
+-    * KBASE_IOCTL_MEM_SYNC.  When the architecture exposes userspace cache
+-    * maintenance, the generic kmod layer issues the same range operations
+-    * directly and batches one barrier per submit.  This removes dozens of
+-    * ioctls per second on G710.  PANVK_KBASE_USER_CACHE_SYNC=0 keeps the
+-    * kernel path as a compatibility override; architectures without cache
+-    * ops fall back automatically. */
++   /* Route cached-BO synchronization through KBASE_IOCTL_MEM_SYNC by
++    * default.  Userspace `dc cvac/civac` only maintains the issuing CPU's
++    * caches; with migration between clusters it is not sufficient, while the
++    * kernel ioctl performs the maintenance with the correct barriers and
++    * mmap bookkeeping.  PANVK_KBASE_USER_CACHE_SYNC=1 restores the userspace
++    * fast path. */
+    const char *user_cache_sync = getenv("PANVK_KBASE_USER_CACHE_SYNC");
+-   if (user_cache_sync && !strcmp(user_cache_sync, "0"))
++   if (!user_cache_sync || strcmp(user_cache_sync, "1"))
+       flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
+ 
+    pan_kmod_dev_init(&kbase_dev->base, fd, flags, &kbase_drv,
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index c4638a955cc..8c6d06ef3a0 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -29,6 +29,7 @@
+ 
+ #include "drm-uapi/panfrost_drm.h"
+ #include "drm-uapi/mali_kbase_ioctl.h"
++#include <inttypes.h>
+ #include <poll.h>
+ 
+ struct panvk_kbase_event_v2 {
+@@ -41,7 +42,11 @@ struct panvk_kbase_event_v2 {
+ static int
+ panvk_kbase_submit_and_wait(int fd, uint64_t jc, uint32_t core_req)
+ {
+-   uint8_t atom_bytes[48];
++   /* The kbase uAPI version on this device reports 11.16 but enforces the
++    * 11.19+ 56-byte base_jd_atom_v2 stride (renderpass_id + padding[7]).
++    * A 48-byte stride is rejected with EINVAL.  The extra 8 bytes must be
++    * zero (renderpass 0, zero padding). */
++   uint8_t atom_bytes[56];
+    memset(atom_bytes, 0, sizeof(atom_bytes));
+    memcpy(atom_bytes + 0, &jc, 8);
+    atom_bytes[40] = 1;
+@@ -50,24 +55,36 @@ panvk_kbase_submit_and_wait(int fd, uint64_t jc, uint32_t core_req)
+    struct kbase_ioctl_job_submit submit = {
+       .addr = (uint64_t)(uintptr_t)atom_bytes,
+       .nr_atoms = 1,
+-      .stride = 48,
++      .stride = sizeof(atom_bytes),
+    };
+ 
+-   if (ioctl(fd, KBASE_IOCTL_JOB_SUBMIT, &submit))
++   if (ioctl(fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
++      mesa_loge("kbase: JOB_SUBMIT(jc=0x%" PRIx64 ") failed: %s",
++                jc, strerror(errno));
+       return -errno;
++   }
+ 
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int pret = poll(&pfd, 1, 5000);
+-   if (pret <= 0 || !(pfd.revents & POLLIN))
++   if (pret <= 0 || !(pfd.revents & POLLIN)) {
++      mesa_loge("kbase: job event poll(jc=0x%" PRIx64 ") ret=%d revents=0x%x",
++                jc, pret, pfd.revents);
+       return -110;
++   }
+ 
+    struct panvk_kbase_event_v2 event;
+    ssize_t n = read(fd, &event, sizeof(event));
+-   if (n != sizeof(event))
++   if (n != sizeof(event)) {
++      mesa_loge("kbase: short job event read (jc=0x%" PRIx64 "): %zd bytes",
++                jc, n);
+       return -5;
++   }
+ 
+-   if (event.event_code != 0x1)
++   if (event.event_code != 0x1) {
++      mesa_loge("kbase: job 0x%" PRIx64 " (atom %u) failed: event 0x%x",
++                jc, event.atom_number, event.event_code);
+       return -(int)event.event_code;
++   }
+ 
+    return 0;
+ }
+@@ -111,6 +128,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+ 
+    if (batch->vtc_jc.first_job) {
+       ret = panvk_kbase_submit_and_wait(dev->drm_fd, batch->vtc_jc.first_job, 0x16) /* PATCH: T|CS|V combined, vtc_jc may contain mixed job types */;
++      if (ret)
++         mesa_loge("panvk: kbase vtc submit failed: %d", ret);
+       assert(!ret);
+ 
+       if (PANVK_DEBUG(TRACE)) {
+@@ -125,6 +144,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+ 
+    if (batch->frag_jc.first_job) {
+       ret = panvk_kbase_submit_and_wait(dev->drm_fd, batch->frag_jc.first_job, 0x01);
++      if (ret)
++         mesa_loge("panvk: kbase frag submit failed: %d", ret);
+       assert(!ret);
+       if (PANVK_DEBUG(TRACE)) {
+          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+@@ -356,9 +377,6 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
+    *out_queue = &queue->vk;
+    return VK_SUCCESS;
+ 
+-err_finish_queue:
+-   vk_queue_finish(&queue->vk);
+-
+ err_free_queue:
+    vk_free(&device->vk.alloc, queue);
+    return result;

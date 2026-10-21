@@ -1,0 +1,92 @@
+From 46cf93f06dd2b44dc81d90e3dd39196a5dc5f172 Mon Sep 17 00:00:00 2001
+From: PanVK kbase bring-up <panvk@localhost>
+Date: Wed, 21 Oct 2026 12:49:45 +0300
+Subject: [PATCH panvk-kirin990 16/23] panvk: request linear swapchain buffers
+ on Huawei gralloc
+
+Huawei gralloc on Kirin 990 allocates GPU-rendered swapchain buffers as
+AFBC with a vendor address scramble.  PanVK cannot consume that layout,
+so the WSI imported the buffer as linear and the display showed a black
+frame with edge artifacts.
+
+Add SW_READ_OFTEN|SW_WRITE_OFTEN to the gralloc0 usage and the matching
+gralloc1 producer/consumer CPU flags.  The gralloc then returns a linear,
+uncompressed buffer, which matches the existing ANB import path.
+
+Also log the Huawei private_handle_t fields once so future reports can
+confirm that the linear path was taken.
+---
+ src/util/u_gralloc/u_gralloc_fallback.c | 17 +++++++++++++++++
+ src/vulkan/runtime/vk_android.c         | 24 ++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/src/util/u_gralloc/u_gralloc_fallback.c b/src/util/u_gralloc/u_gralloc_fallback.c
+index 44fb32d8cfd..8d9f8b331d3 100644
+--- a/src/util/u_gralloc/u_gralloc_fallback.c
++++ b/src/util/u_gralloc/u_gralloc_fallback.c
+@@ -141,6 +141,23 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
+       return -EINVAL;
+    }
+ 
++   /* Temporary diagnostic: identify Huawei's private_handle_t so we can
++    * confirm whether the linear-swapchain request actually took effect.
++    */
++   if (hnd->handle->numInts >= 0x51 &&
++       (unsigned)hnd->handle->data[2] == 0x03141592u) {
++      static int logged_huawei_handle;
++      if (!logged_huawei_handle) {
++         const int *d = hnd->handle->data;
++         mesa_logi("Huawei gralloc handle: %dx%d fmt=0x%x isAfbc=%u "
++                   "afbcHdr=0x%x payloadStride=0x%x scramble=%u "
++                   "byteStride=%u pixelStride=%u",
++                   d[31], d[32], d[3], d[6] & 0xff,
++                   d[45], d[46], d[47], d[8], d[9]);
++         logged_huawei_handle = 1;
++      }
++   }
++
+    out->drm_fourcc = drm_fourcc;
+    out->modifier = DRM_FORMAT_MOD_INVALID;
+    out->num_planes = num_planes;
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index ea72f1bedc6..b43bf11f861 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -417,6 +417,18 @@ setup_gralloc0_usage(VkFormat format, VkImageUsageFlags image_usage,
+    if (!gralloc_usage)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
++   /* Huawei's gralloc (Kirin 990 / EMUI 10) enables AFBC plus a
++    * vendor-specific address scramble for GPU-rendered swapchain buffers.
++    * PanVK cannot consume that layout, so ask for a CPU-accessible buffer:
++    * SW_*_OFTEN makes the gralloc fall back to a linear, uncompressed
++    * allocation which the WSI import path already understands.
++    */
++   gralloc_usage |= GRALLOC_USAGE_SW_READ_OFTEN |
++                    GRALLOC_USAGE_SW_WRITE_OFTEN;
++
++   mesa_logi("PanVK Android WSI: gralloc0 usage 0x%x (forcing linear swapchain)",
++             gralloc_usage);
++
+    *out_gralloc_usage = gralloc_usage;
+ 
+    return VK_SUCCESS;
+@@ -623,6 +635,18 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
+    if (gralloc_usage & GRALLOC_USAGE_HW_TEXTURE)
+       *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_GPU_TEXTURE;
+ 
++   /* Match the gralloc0 SW_*_OFTEN request above in gralloc1 terms.  The
++    * producer flags are what the Huawei allocator consults when deciding
++    * whether AFBC is allowed.
++    */
++   *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_CPU_READ_OFTEN;
++   *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_CPU_READ_OFTEN |
++                            GRALLOC1_PRODUCER_USAGE_CPU_WRITE_OFTEN;
++
++   mesa_logi("PanVK Android WSI: gralloc1 consumer=0x%llx producer=0x%llx",
++             (unsigned long long)*grallocConsumerUsage,
++             (unsigned long long)*grallocProducerUsage);
++
+    /* for front buffer rendering */
+    if (swapchainImageUsage & VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID)
+       *grallocProducerUsage |= vk_android_get_front_buffer_usage();

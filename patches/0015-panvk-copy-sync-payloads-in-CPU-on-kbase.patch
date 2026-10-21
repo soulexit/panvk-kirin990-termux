@@ -1,0 +1,64 @@
+From 7825563fc1862684e7b2f9a58c83eb4381c89d9f Mon Sep 17 00:00:00 2001
+From: PanVK kbase <panvk@localhost>
+Date: Wed, 21 Oct 2026 11:49:25 +0300
+Subject: [PATCH panvk-kirin990 15/23] panvk: copy sync payloads in CPU on
+ kbase
+
+kbase has no DRM syncobjs and no DRM fd.  device->copy_sync_payloads
+was still pointing at vk_drm_syncobj_copy_payloads(), so the Android
+native-buffer present path tried drmSyncobjExportSyncFile() on the
+kbase fd with a bogus syncobj handle.  The ioctl failed with ENOTTY
+and vkQueueSignalReleaseImageANDROID() returned VK_ERROR_UNKNOWN,
+which made vkQueuePresentKHR() fail and ARMSX2 lose the surface.
+
+Use a kbase-specific payload-copy helper that waits for the source
+syncs to complete and then signals the destinations.  This is the
+same CPU-wait model as kbase_cpu_sync_export_sync_file() and keeps
+the WSI present path off the DRM ioctl path.
+---
+ src/panfrost/vulkan/panvk_vX_device.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index f4f5c7f6504..01f1c6bd3e5 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -45,6 +45,27 @@
+ #include "pan_samples.h"
+ #include "poly/geometry.h"
+ 
++#ifdef HAVE_PAN_KMOD_KBASE
++/* kbase has no DRM syncobjs.  Its vk_sync_type keeps a CPU payload that
++ * tracks GPU completion, so copy payloads by waiting for all sources and
++ * then signalling the destinations directly.
++ */
++static VkResult
++panvk_kbase_copy_sync_payloads(struct vk_device *device,
++                               uint32_t wait_count,
++                               const struct vk_sync_wait *waits,
++                               uint32_t signal_count,
++                               const struct vk_sync_signal *signals)
++{
++   VkResult result = vk_sync_wait_many(device, wait_count, waits,
++                                       VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
++   if (result != VK_SUCCESS)
++      return result;
++
++   return vk_sync_signal_many(device, signal_count, signals);
++}
++#endif
++
+ static void *
+ panvk_kmod_zalloc(const struct pan_kmod_allocator *allocator, size_t size,
+                   bool transient)
+@@ -462,6 +483,10 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+    device->vk.check_status = panvk_device_check_status;
+    device->vk.get_timestamp = panvk_device_get_timestamp;
+    device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
++#ifdef HAVE_PAN_KMOD_KBASE
++   if (physical_device->kbase_node_path[0])
++      device->vk.copy_sync_payloads = panvk_kbase_copy_sync_payloads;
++#endif
+ 
+    device->kmod.allocator = (struct pan_kmod_allocator){
+       .zalloc = panvk_kmod_zalloc,

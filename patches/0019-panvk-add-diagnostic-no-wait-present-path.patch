@@ -1,0 +1,67 @@
+From cdd1cb0c36f81d75f1127b78d1771de7049aec31 Mon Sep 17 00:00:00 2001
+From: panvk-luke <panvk-luke@localhost>
+Date: Wed, 21 Oct 2026 15:27:22 +0300
+Subject: [PATCH panvk-kirin990 19/23] panvk: add diagnostic no-wait present
+ path
+
+When /sdcard/Android/data/com.armsx2.nightly/files/logs/panvk_nowait
+exists (or PANVK_NOWAIT_PRESENT=1), copy_sync_payloads signals the
+present semaphore without waiting for the render-finished semaphore and
+returns an empty fence.  This is a controlled experiment to measure how
+much of the frame is CPU/present serialisation; normal behaviour still
+waits.
+---
+ src/panfrost/vulkan/panvk_vX_device.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 01f1c6bd3e5..c9ff8cbe637 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -36,6 +36,8 @@
+ 
+ #ifdef HAVE_PAN_KMOD_KBASE
+ #include <fcntl.h>
++#include <stdlib.h>
++#include <unistd.h>
+ #endif
+ 
+ #include "kmod/pan_kmod.h"
+@@ -50,6 +52,21 @@
+  * tracks GPU completion, so copy payloads by waiting for all sources and
+  * then signalling the destinations directly.
+  */
++static bool
++panvk_kbase_nowait_present(void)
++{
++   const char *env = getenv("PANVK_NOWAIT_PRESENT");
++   if (env && env[0] == 1)
++      return true;
++
++   /* Diagnostic switch, toggled from the host without repacking the
++    * driver: when this file exists, present does not wait for rendering
++    * to finish and returns an empty fence.  Used to measure how much of
++    * the frame is CPU/present serialisation. */
++   return access("/sdcard/Android/data/com.armsx2.nightly/files/logs/panvk_nowait",
++                 F_OK) == 0;
++}
++
+ static VkResult
+ panvk_kbase_copy_sync_payloads(struct vk_device *device,
+                                uint32_t wait_count,
+@@ -57,6 +74,15 @@ panvk_kbase_copy_sync_payloads(struct vk_device *device,
+                                uint32_t signal_count,
+                                const struct vk_sync_signal *signals)
+ {
++   if (panvk_kbase_nowait_present()) {
++      static bool logged;
++      if (!logged) {
++         mesa_logi("PanVK: present no-wait experiment enabled");
++         logged = true;
++      }
++      return vk_sync_signal_many(device, signal_count, signals);
++   }
++
+    VkResult result = vk_sync_wait_many(device, wait_count, waits,
+                                        VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+    if (result != VK_SUCCESS)

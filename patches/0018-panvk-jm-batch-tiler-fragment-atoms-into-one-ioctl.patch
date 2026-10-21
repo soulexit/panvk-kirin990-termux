@@ -1,0 +1,378 @@
+From c26e5754225b0af0e4c175a09d95d95bd6fcd9bc Mon Sep 17 00:00:00 2001
+From: panvk-luke <panvk-luke@localhost>
+Date: Wed, 21 Oct 2026 15:09:38 +0300
+Subject: [PATCH panvk-kirin990 18/23] panvk/jm: batch tiler+fragment atoms
+ into one ioctl
+
+Submit the tiler and fragment atoms of a PanVK batch in a single
+JOB_SUBMIT ioctl.  The kernel walks the user atom array with the 56-byte
+uAPI stride, so pack each atom into a stride-sized slot instead of
+passing the 64-byte C struct array directly; the misaligned second atom
+made the tiler atom fail with event 0x4003.
+
+Also append submit/wait statistics to
+/sdcard/Android/data/com.armsx2.nightly/files/logs/panvk_jm.log (or the
+path in PANVK_JM_LOG), since ARMSX2 does not capture driver stderr.  The
+summary records atoms per submit, submit microseconds and output-wait
+microseconds, which separates driver CPU cost from GPU/present cost.
+---
+ src/panfrost/lib/kmod/kbase_kmod.c          |  95 +++++++++++
+ src/panfrost/lib/kmod/kbase_kmod.h          |   9 ++
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 166 +++++++++++++-------
+ 3 files changed, 217 insertions(+), 53 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 49778b2ca27..d377e6a6af3 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -2314,6 +2314,101 @@ kbase_kmod_job_submit_dep(struct pan_kmod_dev *dev, uint64_t jc,
+    return atom.atom_number;
+ }
+ 
++uint64_t
++kbase_kmod_submit_batch(struct pan_kmod_dev *dev, uint64_t vtc_jc,
++                        uint64_t frag_jc, uint64_t prev_atom)
++{
++   struct kbase_kmod_dev *kd = container_of(dev, struct kbase_kmod_dev, base);
++   if (kd->is_csf) {
++      errno = ENOTSUP;
++      return 0;
++   }
++
++   const bool has_vtc = vtc_jc != 0;
++   const bool has_frag = frag_jc != 0;
++   if (!has_vtc && !has_frag)
++      return prev_atom;
++
++   struct kbase_atom_slot *slots[2] = { NULL, NULL };
++   unsigned nr = 0;
++
++   if (has_vtc) {
++      slots[nr] = kbase_atom_alloc(kd, BASE_JD_REQ_T | BASE_JD_REQ_CS |
++                                   BASE_JD_REQ_V, has_frag);
++      if (!slots[nr])
++         return 0;
++      nr++;
++   }
++   if (has_frag) {
++      slots[nr] = kbase_atom_alloc(kd, BASE_JD_REQ_FS, false);
++      if (!slots[nr]) {
++         if (slots[0]) {
++            simple_mtx_lock(&kd->atoms_lock);
++            slots[0]->atom_number = 0;
++            simple_mtx_unlock(&kd->atoms_lock);
++         }
++         return 0;
++      }
++      nr++;
++   }
++
++   struct base_jd_atom atoms[2] = { 0 };
++   uint64_t vtc_num = 0, frag_num = 0;
++   unsigned idx = 0;
++
++   if (has_vtc) {
++      vtc_num = slots[idx]->atom_number;
++      atoms[idx].jc = vtc_jc;
++      atoms[idx].core_req = BASE_JD_REQ_T | BASE_JD_REQ_CS | BASE_JD_REQ_V;
++      atoms[idx].atom_number = (uint8_t)vtc_num;
++      if (prev_atom) {
++         atoms[idx].pre_dep[0].atom_id = (uint8_t)prev_atom;
++         atoms[idx].pre_dep[0].dependency_type = BASE_JD_DEP_TYPE_DATA;
++      }
++      idx++;
++   }
++
++   if (has_frag) {
++      frag_num = slots[idx]->atom_number;
++      atoms[idx].jc = frag_jc;
++      atoms[idx].core_req = BASE_JD_REQ_FS;
++      atoms[idx].atom_number = (uint8_t)frag_num;
++      const uint64_t dep = has_vtc ? vtc_num : prev_atom;
++      if (dep) {
++         atoms[idx].pre_dep[0].atom_id = (uint8_t)dep;
++         atoms[idx].pre_dep[0].dependency_type = BASE_JD_DEP_TYPE_DATA;
++      }
++      idx++;
++   }
++
++   /* The kernel walks the user atom array with the uAPI stride (56 bytes
++    * on this generation), while the literal C struct is 64 bytes.  Pack
++    * each atom into a stride-sized slot instead of passing the struct
++    * array directly, otherwise the second atom is read from the middle
++    * of the first one. */
++   uint8_t atom_buf[2 * KBASE_JM_ATOM_STRIDE];
++   for (unsigned i = 0; i < nr; i++) {
++      memcpy(&atom_buf[i * KBASE_JM_ATOM_STRIDE], &atoms[i],
++             KBASE_JM_ATOM_STRIDE);
++   }
++
++   struct kbase_ioctl_job_submit sub = {
++      .addr = (uintptr_t)atom_buf,
++      .nr_atoms = nr,
++      .stride = KBASE_JM_ATOM_STRIDE,
++   };
++   if (ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &sub) < 0) {
++      mesa_loge("kbase: JOB_SUBMIT(batch) failed: %s", strerror(errno));
++      simple_mtx_lock(&kd->atoms_lock);
++      for (unsigned i = 0; i < nr; i++)
++         slots[i]->atom_number = 0;
++      simple_mtx_unlock(&kd->atoms_lock);
++      return 0;
++   }
++
++   return has_frag ? frag_num : vtc_num;
++}
++
+ void
+ kbase_kmod_atom_release(struct pan_kmod_dev *dev, uint64_t atom_num)
+ {
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index 01ae090e572..c8a4a1d4cd0 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -119,6 +119,15 @@ uint64_t kbase_kmod_job_submit_dep(struct pan_kmod_dev *dev, uint64_t jc,
+                                    uint8_t dep0_type, uint64_t dep1,
+                                    uint8_t dep1_type, bool no_waiter);
+ 
++/* Submit the tiler and fragment atoms of one PanVK batch in a single
++ * JOB_SUBMIT ioctl.  vtc_jc/frag_jc may be zero when absent.  The
++ * fragment atom depends on the tiler atom with DATA, and the tiler atom
++ * depends on prev_atom (the previous queue tail) with DATA.  Returns the
++ * last submitted atom number, prev_atom when there is nothing to submit,
++ * or 0 on failure. */
++uint64_t kbase_kmod_submit_batch(struct pan_kmod_dev *dev, uint64_t vtc_jc,
++                                 uint64_t frag_jc, uint64_t prev_atom);
++
+ /* Wait for a JM atom.  timeout_ns < 0 waits forever.  Returns true when
+  * the atom completed successfully. */
+ bool kbase_kmod_wait_atom(struct pan_kmod_dev *dev, uint64_t atom_number,
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index a6867922f3a..3197c0fc5d9 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -34,12 +34,70 @@
+ 
+ #include "drm-uapi/panfrost_drm.h"
+ #include "drm-uapi/mali_kbase_ioctl.h"
++#include <fcntl.h>
+ #include <inttypes.h>
+ #include <poll.h>
+-
+-/* Lightweight diagnostics: one line every 120 submissions/waits. */
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++/* Lightweight diagnostics: one summary line every 120 submissions/waits.
++ * The summary is also appended to a file inside ARMSX2's own scoped
++ * storage, because the app's emulog does not capture driver stderr. */
+ static uint64_t jm_diag_submit_ns, jm_diag_wait_ns;
++static uint64_t jm_diag_submit_max_ns, jm_diag_wait_max_ns;
+ static unsigned jm_diag_submits, jm_diag_waits, jm_diag_atoms;
++static unsigned jm_diag_atoms_max;
++
++static int jm_log_fd = -2;
++static pthread_mutex_t jm_log_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void
++panvk_jm_log_init(void)
++{
++   if (jm_log_fd != -2)
++      return;
++
++   const char *path = getenv("PANVK_JM_LOG");
++   if (!path || !path[0])
++      path = "/sdcard/Android/data/com.armsx2.nightly/files/logs/panvk_jm.log";
++
++   jm_log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
++   if (jm_log_fd < 0)
++      return;
++
++   char hdr[320];
++   int n = snprintf(hdr, sizeof(hdr), "PanVK JM log: %s (pid %d)\n",
++                    path, (int)getpid());
++   if (n > 0)
++      (void)write(jm_log_fd, hdr, n);
++}
++
++static void
++panvk_jm_log(const char *fmt, ...)
++{
++   if (jm_log_fd == -2)
++      panvk_jm_log_init();
++   if (jm_log_fd < 0)
++      return;
++
++   char buf[512];
++   va_list ap;
++   va_start(ap, fmt);
++   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++   va_end(ap);
++   if (n <= 0)
++      return;
++   if (n > (int)sizeof(buf))
++      n = sizeof(buf);
++
++   pthread_mutex_lock(&jm_log_lock);
++   ssize_t res = write(jm_log_fd, buf, n);
++   (void)res;
++   pthread_mutex_unlock(&jm_log_lock);
++}
+ 
+ /* Wait function installed on every output vk_sync.  It blocks on the
+  * kbase atom numbers stored in targets[]; all earlier atoms of the submit
+@@ -73,7 +131,10 @@ panvk_jm_kbase_wait_atoms(
+       }
+    }
+ 
+-   jm_diag_wait_ns += os_time_get_nano() - wait_t0;
++   const uint64_t wait_dt = os_time_get_nano() - wait_t0;
++   jm_diag_wait_ns += wait_dt;
++   if (wait_dt > jm_diag_wait_max_ns)
++      jm_diag_wait_max_ns = wait_dt;
+    jm_diag_waits++;
+    return result;
+ }
+@@ -115,62 +176,37 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+ 
+    const bool has_vtc = batch->vtc_jc.first_job != 0;
+    const bool has_frag = batch->frag_jc.first_job != 0;
+-   uint64_t vtc_atom = 0;
+-
+-   if (has_vtc) {
+-      vtc_atom = kbase_kmod_job_submit_dep(
+-         dev->kmod.dev, batch->vtc_jc.first_job,
+-         BASE_JD_REQ_T | BASE_JD_REQ_CS | BASE_JD_REQ_V,
+-         *last_atom, *last_atom ? BASE_JD_DEP_TYPE_DATA : 0, 0, 0,
+-         has_frag);
+-      if (!vtc_atom) {
+-         mesa_loge("panvk: kbase vtc submit failed");
+-         *failed = true;
+-         return;
+-      }
+-      (*atom_count)++;
+ 
+-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(DUMP)) {
+-         /* Debug decoding needs the job to be complete. */
+-         kbase_kmod_wait_atom(dev->kmod.dev, vtc_atom, -1);
+-         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
++   const uint64_t tail_atom = kbase_kmod_submit_batch(
++      dev->kmod.dev, has_vtc ? batch->vtc_jc.first_job : 0,
++      has_frag ? batch->frag_jc.first_job : 0, *last_atom);
+ 
+-         if (PANVK_DEBUG(TRACE))
+-            pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
+-                         phys_dev->kmod.dev->props.gpu_id);
+-         if (PANVK_DEBUG(DUMP))
+-            pandecode_dump_mappings(dev->debug.decode_ctx);
+-      }
+-
+-      *last_atom = vtc_atom;
++   if (!tail_atom) {
++      mesa_loge("panvk: kbase batch submit failed");
++      *failed = true;
++      return;
+    }
+ 
+-   if (has_frag) {
+-      uint64_t frag_dep = has_vtc ? vtc_atom : *last_atom;
+-      uint8_t frag_dep_type = frag_dep ? BASE_JD_DEP_TYPE_DATA : 0;
+-
+-      uint64_t frag_atom = kbase_kmod_job_submit_dep(
+-         dev->kmod.dev, batch->frag_jc.first_job, BASE_JD_REQ_FS,
+-         frag_dep, frag_dep_type, 0, 0, false);
+-      if (!frag_atom) {
+-         mesa_loge("panvk: kbase frag submit failed");
+-         *failed = true;
+-         return;
+-      }
+-      (*atom_count)++;
++   *atom_count += (has_vtc ? 1 : 0) + (has_frag ? 1 : 0);
++   *last_atom = tail_atom;
+ 
+-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(DUMP)) {
+-         kbase_kmod_wait_atom(dev->kmod.dev, frag_atom, -1);
+-         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
++   if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(DUMP)) {
++      /* Debug decoding needs the whole batch to be complete.  The
++       * fragment atom depends on the tiler atom, so waiting for the
++       * returned tail covers both. */
++      kbase_kmod_wait_atom(dev->kmod.dev, tail_atom, -1);
++      panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+ 
+-         if (PANVK_DEBUG(TRACE))
++      if (PANVK_DEBUG(TRACE)) {
++         if (has_vtc)
++            pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
++                         phys_dev->kmod.dev->props.gpu_id);
++         if (has_frag)
+             pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
+                          phys_dev->kmod.dev->props.gpu_id);
+-         if (PANVK_DEBUG(DUMP))
+-            pandecode_dump_mappings(dev->debug.decode_ctx);
+       }
+-
+-      *last_atom = frag_atom;
++      if (PANVK_DEBUG(DUMP))
++         pandecode_dump_mappings(dev->debug.decode_ctx);
+    }
+ 
+    if (PANVK_DEBUG(TRACE))
+@@ -273,8 +309,11 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+          break;
+    }
+ 
+-   if (failed)
++   if (failed) {
++      panvk_jm_log("submit failed after %u atoms, %" PRIu64 " us\n",
++                   atom_count, (os_time_get_nano() - t0) / 1000);
+       return VK_ERROR_DEVICE_LOST;
++   }
+ 
+    if (atom_count == 0) {
+       /* Nothing new was submitted.  Keep the previous queue tail, but do
+@@ -306,9 +345,16 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+    jm_diag_submit_ns += dt;
+    jm_diag_atoms += atom_count;
+    jm_diag_submits++;
++   if (dt > jm_diag_submit_max_ns)
++      jm_diag_submit_max_ns = dt;
++   if (atom_count > jm_diag_atoms_max)
++      jm_diag_atoms_max = atom_count;
+ 
+-   if (jm_diag_submits == 1)
++   if (jm_diag_submits == 1) {
+       mesa_logi("PanVK JM: async atom submission active (%u atoms)", atom_count);
++      panvk_jm_log("active: first submit %u atoms, %" PRIu64 " us\n",
++                   atom_count, dt / 1000);
++   }
+ 
+    if (jm_diag_submits % 120 == 0) {
+       mesa_logi("PanVK JM: submit avg %.2f ms, %.1f atoms/submit, "
+@@ -318,8 +364,22 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+                 jm_diag_waits ? (double)jm_diag_wait_ns / 1e6 / jm_diag_waits
+                               : 0.0,
+                 jm_diag_waits);
++      panvk_jm_log("submit n=%u atoms_avg_x10=%u atoms_max=%u "
++                   "submit_us_avg=%u submit_us_max=%u wait_n=%u "
++                   "wait_us_avg=%u wait_us_max=%u\n",
++                   jm_diag_submits,
++                   (unsigned)((jm_diag_atoms * 10) / jm_diag_submits),
++                   jm_diag_atoms_max,
++                   (unsigned)(jm_diag_submit_ns / 1000 / jm_diag_submits),
++                   (unsigned)(jm_diag_submit_max_ns / 1000),
++                   jm_diag_waits,
++                   jm_diag_waits
++                      ? (unsigned)(jm_diag_wait_ns / 1000 / jm_diag_waits)
++                      : 0,
++                   (unsigned)(jm_diag_wait_max_ns / 1000));
+       jm_diag_submit_ns = jm_diag_wait_ns = 0;
+-      jm_diag_submits = jm_diag_waits = jm_diag_atoms = 0;
++      jm_diag_submit_max_ns = jm_diag_wait_max_ns = 0;
++      jm_diag_submits = jm_diag_waits = jm_diag_atoms = jm_diag_atoms_max = 0;
+    }
+ 
+    return VK_SUCCESS;

@@ -1,0 +1,28 @@
+From e7cab4579fdd13ccc13ebbbb6f06cdca62bd3269 Mon Sep 17 00:00:00 2001
+From: OpenCode Build <build@localhost>
+Date: Mon, 19 Oct 2026 20:37:36 +0300
+Subject: [PATCH panvk-kirin990 09/23] build(termux): restrict panvk to JM
+ archs (6,7) with kbase-only; CSF needs panthor
+
+---
+ src/panfrost/vulkan/meson.build | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/meson.build b/src/panfrost/vulkan/meson.build
+index 36589235e6f..6ccb4d43fee 100644
+--- a/src/panfrost/vulkan/meson.build
++++ b/src/panfrost/vulkan/meson.build
+@@ -142,7 +142,12 @@ common_per_arch_files = [
+   sha1_h,
+ ]
+ 
+-foreach arch : [6, 7, 10, 12, 13, 14]
++# Termux/kbase portability fix: the kbase backend only implements the Job
++# Manager (Bifrost/JM) path.  The CSF (Valhall) panvk sources reference
++# panthor-only helpers (panthor_kmod_get_csif_props / panthor_kmod_get_flush_id)
++# that are not compiled when the panthor kmd is not selected, so only build the
++# JM architectures in that configuration.
++foreach arch : ((panfrost_kmds.contains('kbase') and not panfrost_kmds.contains('panthor')) ? [6, 7] : [6, 7, 10, 12, 13, 14])
+   per_arch_files = common_per_arch_files
+   inc_panvk_per_arch = []
+ 
