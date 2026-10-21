@@ -190,3 +190,5 @@ optimization before that measurement.
 - The v10diag pack is a measurement build; v9 is the current ARMSX2
   testing candidate.
 - Full build/validation history: [BUILD_REPORT.md](docs/BUILD_REPORT.md).
+- Raw v9 ARMSX2 logs are kept in the companion repository under
+  [`docs/`](https://github.com/soulexit/panvk-kirin990-armsx2/tree/main/docs).
