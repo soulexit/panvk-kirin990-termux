@@ -1,5 +1,9 @@
 # panvk-kirin990-termux
 
+> **Archived.** New driver releases for every app (Winlator, Eden, ARMSX2, other
+> AdrenoTools apps) are in [soulexit/panvk-kirin990](https://github.com/soulexit/panvk-kirin990).
+> This repository is kept read-only for reference.
+
 Experimental **Mesa PanVK** Vulkan driver for the Huawei P40 / Kirin 990
 (**Mali-G76 MC16**) over the Android **kbase/JM** kernel interface.  This
 repository contains the Termux/Winlator build recipe, the driver patch
